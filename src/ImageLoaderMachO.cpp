@@ -58,6 +58,7 @@
 #endif
 #include "Tracing.h"
 #include "dyld2.h"
+#include "DCC2Reader.h"   // perf#24c2e: DCC2 packed-cache prebinding bypass in doRebase
 
 // <rdar://problem/8718137> use stack guard random value to add padding between dylibs
 extern "C" long __stack_chk_guard;
@@ -1596,6 +1597,20 @@ void ImageLoaderMachO::doRebase(const LinkContext& context)
     // dylibs with thread local variables cannot be unloaded because there is no way to clean up all threads
     if ( !this->inSharedCache() && (this->machHeader()->flags & MH_HAS_TLV_DESCRIPTORS) )
         this->setNeverUnload();
+
+	// perf#24c2e: a DCC2 packed-cache image sets fInSharedCache=true, which would make
+	// usablePrebinding() below return true and SKIP rebase() entirely — but a DCC2 image is NOT
+	// prebound: its fixups live in the cache-native table applied by our guarded rebase(). So for a
+	// DCC2 image, bypass the prebinding shortcut and fall through to rebase() (which routes to
+	// applyAllFixupsOnce). Without this, doRebase returns here, the guard never fires, DATA stays
+	// unfixed, and the first deref of a cached image's GOT/bind pointer crashes (the perf#24c2e 0xdd).
+	{
+		dyld3::DCC2Reader* dcc = dyld3::DCC2Reader::shared();
+		if ( (dcc != nullptr) && dcc->enabled() && dcc->isDCC2Image(this->machHeader()) ) {
+			this->rebase(context, fSlide);
+			return;
+		}
+	}
 
 	// if prebound and loaded at prebound address, then no need to rebase
 	if ( this->usablePrebinding(context) ) {
