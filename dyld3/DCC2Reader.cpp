@@ -194,6 +194,17 @@ bool DCC2Reader::applyAllFixupsOnce(LogFunc logFixups,
                 *loc = v + (uintptr_t)f->addend;
                 break;
             }
+            case DCC2_FIX_BIND_EXTERN_LAZY: {
+                // A lazy bind whose symbol may be genuinely absent (Darling stub gap). Try to resolve; if
+                // not found, write a sentinel (0) instead of hard-failing — preserving lazy "resolve/trap
+                // on first call" semantics for a symbol that is not called on the paths we exercise.
+                const char* sym = _externStr + f->extern_sym;
+                bool found = false;
+                uintptr_t v = resolveExtern ? resolveExtern(sym, found) : 0;
+                *loc = found ? (v + (uintptr_t)f->addend) : (uintptr_t)0;
+                if ( !found && _log ) _log("dyld[DCC2]: lazy extern '%s' unresolved => sentinel 0 (never-called ok)\n", sym);
+                break;
+            }
             default:
                 if(_log)_log("dyld[DCC2]: unknown fixup kind %d (hard fail)\n", f->kind); return false;
         }
@@ -245,6 +256,13 @@ bool DCC2Reader::applyFixups(uint32_t imageIndex, LogFunc logFixups,
                 uintptr_t v = resolveExtern ? resolveExtern(sym, found) : 0;
                 if ( !found ) { if(_log)_log("dyld[DCC2]: extern symbol '%s' unresolved (hard fail)\n", sym); return false; }
                 *loc = v + (uintptr_t)f->addend;
+                break;
+            }
+            case DCC2_FIX_BIND_EXTERN_LAZY: {
+                const char* sym = _externStr + f->extern_sym;
+                bool found = false;
+                uintptr_t v = resolveExtern ? resolveExtern(sym, found) : 0;
+                *loc = found ? (v + (uintptr_t)f->addend) : (uintptr_t)0;
                 break;
             }
             default:

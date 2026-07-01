@@ -25,6 +25,7 @@ namespace dyld3 {
 #define DCC2_FIX_REBASE        0
 #define DCC2_FIX_BIND_INTERNAL 1
 #define DCC2_FIX_BIND_EXTERN   2
+#define DCC2_FIX_BIND_EXTERN_LAZY 3  /* lazy bind: resolve if possible, else write sentinel (no hard-fail) */
 
 struct DCC2Region { uint64_t file_off, size, vm_base; uint32_t prot, _pad; };
 struct DCC2Seg    { char name[16]; uint64_t vmaddr, vmsize, region_off, filesize; uint32_t region_idx, prot; };
