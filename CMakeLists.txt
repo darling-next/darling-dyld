@@ -108,6 +108,7 @@ add_executable(system_loader
 	dyld3/ClosureWriter.cpp
 	dyld3/Tracing.cpp
 	dyld3/Loading.cpp
+	dyld3/DCC2Reader.cpp
 	dyld3/Diagnostics.cpp
 	dyld3/SharedCacheRuntime.cpp
 	dyld3/shared-cache/DyldSharedCache.cpp

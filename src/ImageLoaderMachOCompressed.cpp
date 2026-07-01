@@ -44,6 +44,7 @@
 #include "ImageLoaderMachOCompressed.h"
 #include "Closure.h"
 #include "Array.h"
+#include "DCC2Reader.h"   // perf#24c2e: DCC2 packed-cache guarded hook (flag-gated)
 
 #ifndef BIND_SUBOPCODE_THREADED_SET_JOP
    #define BIND_SUBOPCODE_THREADED_SET_JOP								0x0F
@@ -363,6 +364,35 @@ void ImageLoaderMachOCompressed::throwBadRebaseAddress(uintptr_t address, uintpt
 
 void ImageLoaderMachOCompressed::rebase(const LinkContext& context, uintptr_t slide)
 {
+	// perf#24c2e: DCC2 packed-cache image => the cache-native fixup table replaces BOTH normal rebase
+	// AND bind (rebase+bind+extern in one table). Apply it HERE, in the rebase phase, so the image's
+	// DATA (GOT / bind pointers) is valid before ANYTHING reads it — recursiveRebase runs after
+	// recursiveLoadLibraries has loaded every image, so all cache images are already registered and
+	// cross-image binds resolve. Applied ONCE for the whole cache; the normal opcode rebase (and bind,
+	// below in doBind) are skipped for DCC images. Running the opcode engine on a region-scattered
+	// image is known-wrong (perf#24c2a).
+	{
+		dyld3::DCC2Reader* dcc = dyld3::DCC2Reader::shared();
+		if ( (dcc != nullptr) && dcc->enabled() && dcc->isDCC2Image(this->machHeader()) ) {
+			dcc->noteNormalRebaseSkipped();
+			const LinkContext& ctx = context;
+			bool ok = dcc->applyAllFixupsOnce((dyld3::DCC2Reader::LogFunc)0,
+				^uintptr_t(const char* symbolName, bool& found) {
+					const ImageLoader::Symbol* sym = nullptr;
+					const ImageLoader* image = nullptr;
+					if ( ctx.flatExportFinder(symbolName, &sym, &image) && (image != nullptr) ) {
+						found = true;
+						return image->getExportedSymbolAddress(sym, ctx, nullptr, false);
+					}
+					found = false;
+					return (uintptr_t)0;
+				});
+			if ( !ok )
+				dyld::halt("DCC2: applyAllFixupsOnce failed (hard fail) during rebase");
+			return;
+		}
+	}
+
 	// binary uses chained fixups where are applied during binding
 	if ( fDyldInfo == NULL )
 		return;
@@ -891,6 +921,21 @@ void ImageLoaderMachOCompressed::throwBadBindingAddress(uintptr_t address, uintp
 void ImageLoaderMachOCompressed::doBind(const LinkContext& context, bool forceLazysBound, const ImageLoader* reExportParent)
 {
 	CRSetCrashLogMessage2(this->getPath());
+
+	// perf#24c2e: DCC2 packed-cache image => bind (and rebase) were already applied by the cache-native
+	// fixup table in rebase() (the rebase phase). The normal opcode bind is SKIPPED — running it on a
+	// region-scattered image is known-wrong (perf#24c2a). Invariant: a DCC image must never reach the
+	// opcode engine; the applyAllFixupsOnce guard is idempotent so this is a clean skip.
+	{
+		dyld3::DCC2Reader* dcc = dyld3::DCC2Reader::shared();
+		if ( (dcc != nullptr) && dcc->enabled() && dcc->isDCC2Image(this->machHeader()) ) {
+			dcc->noteNormalBindSkipped();
+			if ( !dcc->allFixupsApplied() )
+				dyld::halt("DCC2: doBind reached for a DCC image before fixups were applied (invariant violation)");
+			CRSetCrashLogMessage2(NULL);
+			return;
+		}
+	}
 
 	// if prebound and loaded at prebound address, and all libraries are same as when this was prebound, then no need to bind
 	// note: flat-namespace binaries need to have imports rebound (even if correctly prebound)

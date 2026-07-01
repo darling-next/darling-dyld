@@ -4107,9 +4107,52 @@ static ImageLoader* loadPhase0(const char* path, const char* orgPath, const Load
 // the path.  Either time, if an image is found, the phases all unwind without checking
 // for other paths.
 //
+// perf#24c2e: DCC2 packed-cache substitution for the dyld2 classic path (flag-gated).
+// If 'path' names a DCC2-cached dylib, instantiate an ImageLoader over the already-mapped cache
+// regions (no open/mmap) and register it, instead of loading from disk. Returns the (possibly
+// pre-existing) ImageLoader for a cached image, or nullptr if 'path' is not cached / reader off.
+static ImageLoader* dccTryLoad(const char* path, const LoadContext& context)
+{
+	dyld3::DCC2Reader* dcc = dyld3::DCC2Reader::shared();
+	if ( (dcc == nullptr) || !dcc->enabled() )
+		return nullptr;
+	uint32_t imageIndex = 0;
+	const dyld3::MachOLoaded* ml = dcc->loadedAddressFor(path, &imageIndex);
+	if ( ml == nullptr )
+		return nullptr;                         // not a cached image => normal disk load
+	const macho_header* mh = (const macho_header*)ml;
+
+	// dedup: if this cached header is already registered, return the existing ImageLoader.
+	for (ImageLoader* existing : sAllImages) {
+		if ( (const void*)existing->machHeader() == (const void*)mh )
+			return existing;
+	}
+
+	// synthesize a stat from the recorded source metadata (dyld records dev/ino/mtime for the image)
+	struct stat info;
+	memset(&info, 0, sizeof(info));
+	if ( dyld3::stat(path, &info) != 0 )
+		memset(&info, 0, sizeof(info));         // best-effort; staleness already validated at init
+
+	// instantiate over the pre-mapped cache regions. slide == arena base (single-slide model):
+	// segActualLoadAddress(i) = seg.vmaddr + slide reproduces each scattered region address.
+	ImageLoader* image = ImageLoaderMachO::instantiateFromCache(mh, path, (long)dcc->slide(), info, gLinkContext);
+	addImage(image);
+	dcc->noteImageRegistered();
+	if ( gLinkContext.verboseMapping )
+		dyld::log("dyld[DCC2]: substituted cached image %s @ %p (index %u)\n", path, (void*)mh, imageIndex);
+	return image;
+}
+
 ImageLoader* load(const char* path, const LoadContext& context, unsigned& cacheIndex)
 {
 	CRSetCrashLogMessage2(path);
+	// perf#24c2e: flag-gated DCC2 packed-cache substitution (no-op when the flag is absent).
+	if ( ImageLoader* dccImage = dccTryLoad(path, context) ) {
+		cacheIndex = UINT32_MAX;
+		CRSetCrashLogMessage2(NULL);
+		return dccImage;
+	}
 	const char* orgPath = path;
 	cacheIndex = UINT32_MAX;
 	
@@ -6108,6 +6151,10 @@ static bool launchWithClosure(const dyld3::closure::LaunchClosure* mainClosure,
 		}
 	});
 
+	// perf#24c2c: flag-gated DCC2 packed-cache reader (DARLING_DYLD_DCC2=1 + DARLING_DYLD_DCC2_PATH).
+	// Absent => nullptr => exact old behavior. Present+broken => halt (or clean fallback if _SOFT=1).
+	loader.setDCC2Reader(dyld3::DCC2Reader::init(envp, (gLinkContext.verboseMapping ? &dolog : &nolog)));
+
 	// recursively load all dependents and fill in allImages array
 	bool someCacheImageOverridden = false;
 	loader.completeAllDependents(diag, someCacheImageOverridden);
@@ -7131,6 +7178,12 @@ reloadAllImages:
 		sMainExecutable = instantiateFromLoadedImage(mainExecutableMH, mainExecutableSlide, sExecPath);
 		gLinkContext.mainExecutable = sMainExecutable;
 		gLinkContext.mainExecutableCodeSigned = hasCodeSignatureLoadCommand(mainExecutableMH);
+
+		// perf#24c2e: flag-gated DCC2 packed-cache reader for the dyld2 CLASSIC path.
+		// DARLING_DYLD_DCC2=1 + DARLING_DYLD_DCC2_PATH. Absent => shared()==nullptr => exact old
+		// behavior. Init here, before dependent libraries are loaded/linked, so loadPhase5load can
+		// substitute cached images and doRebase/doBind can route them to the DCC2 fixup table.
+		dyld3::DCC2Reader::initShared(envp, (gLinkContext.verboseMapping ? &dolog : &nolog));
 
 #if TARGET_OS_SIMULATOR
 		// check main executable is not too new for this OS

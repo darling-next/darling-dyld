@@ -34,6 +34,7 @@
 #include "Closure.h"
 #include "MachOLoaded.h"
 #include "MachOAnalyzerSet.h"
+#include "DCC2Reader.h"
 
 namespace objc_opt {
 struct objc_clsopt_t;
@@ -111,6 +112,9 @@ public:
                                bool allowMissingLazies=false, dyld3::LaunchErrorInfo* launchErrorInfo=nullptr);
 
     void                addImage(const LoadedImage&);
+#if BUILDING_DYLD
+    void                setDCC2Reader(DCC2Reader* r) { _dcc2 = r; }   // perf#24c2c (flag-gated)
+#endif
     void                completeAllDependents(Diagnostics& diag, bool& someCacheImageOverridden);
     void                mapAndFixupAllImages(Diagnostics& diag, bool processDOFs, bool fromOFI, bool* closureOutOfDate, bool* recoverable);
     uintptr_t           resolveTarget(closure::Image::ResolvedSymbolTarget target);
@@ -154,6 +158,9 @@ private:
 
     void                mapImage(Diagnostics& diag, LoadedImage& info, bool fromOFI, bool* closureOutOfDate);
     void                applyFixupsToImage(Diagnostics& diag, LoadedImage& info);
+#if BUILDING_DYLD
+    uintptr_t           dcc2ResolveExtern(const char* symbolName, bool& found) const;   // perf#24c2c
+#endif
     void                registerDOFs(const Array<DOFInfo>& dofs);
     void                setSegmentProtects(const LoadedImage& info, bool write);
 	bool                sandboxBlockedMmap(const char* path);
@@ -189,6 +196,7 @@ private:
     LogFunc                                         _logFixups;
     LogFunc                                         _logDofs;
     dyld3::LaunchErrorInfo*                         _launchErrorInfo;
+    DCC2Reader*                                     _dcc2 = nullptr;   // perf#24c2c (flag-gated; null=off)
 };
 
 
