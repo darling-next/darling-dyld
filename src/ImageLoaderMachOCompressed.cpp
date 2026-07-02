@@ -576,18 +576,29 @@ uintptr_t ImageLoaderMachOCompressed::exportedSymbolAddress(const LinkContext& c
 		throw "symbol is not in trie";
 	//dyld::log("exportedSymbolAddress(): node=%p, nodeOffset=0x%04X in %s\n", symbol, (int)((uint8_t*)symbol - exportTrieStart), this->getShortName());
 	uintptr_t flags = read_uleb128(exportNode, exportTrieEnd);
+	// perf#24f-fix-flockfile-datafixup (#105b): for a region-packed DCC image, the trie's image-relative
+	// offset must be mapped through the segment->region table (a __DATA export like ___stdinp otherwise
+	// resolves into the RX/__TEXT region and yields garbage). Compute the image index once here.
+	dyld3::DCC2Reader* dccExp = dyld3::DCC2Reader::shared();
+	uint32_t dccExpIndex = 0;
+	const bool dccExpImage = ( dccExp != nullptr ) && dccExp->enabled()
+	                         && dccExp->isDCC2Image(this->machHeader(), &dccExpIndex);
 	switch ( flags & EXPORT_SYMBOL_FLAGS_KIND_MASK ) {
 		case EXPORT_SYMBOL_FLAGS_KIND_REGULAR:
 			if ( runResolver && (flags & EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER) ) {
 				// this node has a stub and resolver, run the resolver to get target address
-				uintptr_t stub = read_uleb128(exportNode, exportTrieEnd) + (uintptr_t)fMachOData; // skip over stub
+				uint64_t stubOff = read_uleb128(exportNode, exportTrieEnd); // skip over stub
+				uintptr_t stub = dccExpImage ? dccExp->translateVmaddr(dccExpIndex, stubOff)
+				                             : stubOff + (uintptr_t)fMachOData;
 				// <rdar://problem/10657737> interposing dylibs have the stub address as their replacee
 				uintptr_t interposedStub = interposedAddress(context, stub, requestor);
 				if ( interposedStub != stub )
 					return interposedStub;
 				// stub was not interposed, so run resolver
 				typedef uintptr_t (*ResolverProc)(void);
-				ResolverProc resolver = (ResolverProc)(read_uleb128(exportNode, exportTrieEnd) + (uintptr_t)fMachOData);
+				uint64_t resolverOff = read_uleb128(exportNode, exportTrieEnd);
+				ResolverProc resolver = (ResolverProc)(dccExpImage ? dccExp->translateVmaddr(dccExpIndex, resolverOff)
+				                                                    : resolverOff + (uintptr_t)fMachOData);
 #if __has_feature(ptrauth_calls)
 				resolver = (ResolverProc)__builtin_ptrauth_sign_unauthenticated(resolver, ptrauth_key_asia, 0);
 #endif
@@ -599,11 +610,27 @@ uintptr_t ImageLoaderMachOCompressed::exportedSymbolAddress(const LinkContext& c
 #endif
 				return result;
 			}
-			return read_uleb128(exportNode, exportTrieEnd) + (uintptr_t)fMachOData;
+			{
+				uint64_t symOff = read_uleb128(exportNode, exportTrieEnd);
+				if ( dccExpImage ) {
+					uintptr_t a = dccExp->translateVmaddr(dccExpIndex, symOff);
+					// RED gate (perf#24f-#107): the trie offset is original-image-relative; translateVmaddr
+					// maps it via the DCC6 original seg table to the rewritten arena address (a __DATA export
+					// like ___stdinp lands in the RW region, not RX). A vmaddr covered by no segment is an
+					// invariant violation — hard fail rather than return a garbage (header/loadcmd) address.
+					if ( a == 0 )
+						dyld::halt("DCC2: exported symbol vmaddr not covered by any segment (perf#24f-fix-flockfile-datafixup regression)");
+					return a;
+				}
+				return symOff + (uintptr_t)fMachOData;
+			}
 		case EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL:
 			if ( flags & EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER )
 				dyld::throwf("unsupported exported symbol kind. flags=%lu at node=%p", flags, symbol);
-			return read_uleb128(exportNode, exportTrieEnd) + (uintptr_t)fMachOData;
+			{
+				uint64_t tlvOff = read_uleb128(exportNode, exportTrieEnd);
+				return dccExpImage ? dccExp->translateVmaddr(dccExpIndex, tlvOff) : tlvOff + (uintptr_t)fMachOData;
+			}
 		case EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE:
 			if ( flags & EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER )
 				dyld::throwf("unsupported exported symbol kind. flags=%lu at node=%p", flags, symbol);

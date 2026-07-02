@@ -30,6 +30,10 @@ namespace dyld3 {
 #define DCC2_VERSION 2
 #define DCC5_MAGIC   0x44434335u
 #define DCC5_VERSION 5
+/* perf#24f-#107: DCC6 adds per-seg orig_vmaddr/orig_vmsize (dcc_seg grew) so exported-symbol
+ * addresses (original-image-relative trie offsets) translate correctly to the rewritten arena. */
+#define DCC6_MAGIC   0x44434336u
+#define DCC6_VERSION 6
 #define DCC2_REGION_ALIGN 0x4000
 #define DCC2_MAX_SEGS 8
 #define DCC2_FIX_REBASE        0
@@ -38,7 +42,9 @@ namespace dyld3 {
 #define DCC2_FIX_BIND_EXTERN_LAZY 3  /* lazy bind: resolve if possible, else write sentinel (no hard-fail) */
 
 struct DCC2Region { uint64_t file_off, size, vm_base; uint32_t prot, _pad; };
-struct DCC2Seg    { char name[16]; uint64_t vmaddr, vmsize, region_off, filesize; uint32_t region_idx, prot; };
+/* perf#24f-#107: orig_vmaddr/orig_vmsize are the ORIGINAL (pre-repack) seg vmaddr/vmsize; vmaddr/vmsize
+ * are the REWRITTEN region-relative values. MUST match tools/closure-cache/dcc5-format.h (DCC6). */
+struct DCC2Seg    { char name[16]; uint64_t vmaddr, vmsize, region_off, filesize; uint32_t region_idx, prot; uint64_t orig_vmaddr, orig_vmsize; };
 struct DCC2Image {
     char     path[256];
     uint8_t  uuid[16];
@@ -123,6 +129,14 @@ public:
 
     uint64_t            slide() const { return _arena; }
     const char*         cachePath() const { return _path; }
+
+    // perf#24f-fix-flockfile-datafixup (#105b): translate an image-relative vmaddr (as stored in the
+    // export trie / LC_SEGMENT vmaddrs of the ORIGINAL image) to its runtime address in the 3-region
+    // arena. Normal dyld computes exportAddr = fMachOData + trieOffset, which is only correct for a
+    // contiguously-mapped image; for a region-packed DCC image a __DATA export (e.g. ___stdinp) would
+    // land inside the RX/__TEXT region. This walks the per-image seg table to find the region+offset.
+    // Returns 0 if imageIndex is invalid or vmaddr is not covered by any of the image's segments.
+    uintptr_t           translateVmaddr(uint32_t imageIndex, uint64_t imageRelVmaddr) const;
 
 private:
     bool                mapRegions(int fd);

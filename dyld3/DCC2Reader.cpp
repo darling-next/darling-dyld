@@ -85,8 +85,10 @@ bool DCC2Reader::validate(int fd)
     // perf#24f: accept the DCC5 cache (3-region + pre-rewritten __TEXT). The historical DCC2 cache has a
     // smaller header and stale __TEXT (crashes on non-leaf images) — reject it so production only ever
     // maps a rewritten cache.
-    if ( _hdr->magic != DCC5_MAGIC )     { if(_log)_log("dyld[DCC2]: bad magic (need DCC5)\n"); return false; }
-    if ( _hdr->version != DCC5_VERSION ) { if(_log)_log("dyld[DCC2]: bad version (need 5)\n"); return false; }
+    // perf#24f-#107: require DCC6 (per-seg orig_vmaddr/orig_vmsize). A pre-#107 DCC5 cache lacks them
+    // (dcc_seg is smaller) => reject, so we never translate exports against a rewritten-only seg table.
+    if ( _hdr->magic != DCC6_MAGIC )     { if(_log)_log("dyld[DCC2]: bad magic (need DCC6)\n"); return false; }
+    if ( _hdr->version != DCC6_VERSION ) { if(_log)_log("dyld[DCC2]: bad version (need 6)\n"); return false; }
     _images    = (DCC2Image*)(_cache + sizeof(DCC2Header));
     _fixups    = (DCC2Fixup*)(_cache + _hdr->fixup_off);
     _externStr = (const char*)(_cache + _hdr->extern_off);
@@ -165,6 +167,30 @@ bool DCC2Reader::isDCC2Image(const struct mach_header* mh, uint32_t* outIndex) c
         }
     }
     return false;
+}
+
+// perf#24f-fix-flockfile-datafixup (#105b): map an image-relative vmaddr to its runtime address in
+// the 3-region arena. The export trie stores each symbol's address as an offset from the image's
+// preferred base (== the ORIGINAL LC_SEGMENT vmaddr). For a region-packed DCC image the segment
+// containing that vmaddr may be the __DATA seg living in the RW region, so we cannot just add the
+// RX/__TEXT base (the bug: bash's ___stdinp resolved into the RX region → "m_pthrea" FILE*).
+//
+// The export trie address is ORIGINAL-image-relative, so we test containment against each seg's
+// ORIGINAL vmaddr range (orig_vmaddr/orig_vmsize, recorded by the DCC6 builder) and map to the
+// REWRITTEN region-relative destination via region_off. Using seg.vmaddr (rewritten) here would be
+// a coordinate-space error (#106: ___stdinp orig off 0xc8890 vs rewritten __DATA vmaddr 0x5ac000).
+uintptr_t DCC2Reader::translateVmaddr(uint32_t imageIndex, uint64_t imageRelVmaddr) const
+{
+    if ( !enabled() || imageIndex >= _hdr->image_count ) return 0;
+    const DCC2Image& img = _images[imageIndex];
+    for ( uint32_t s = 0; s < img.nsegs; ++s ) {
+        const DCC2Seg& seg = img.segs[s];
+        if ( imageRelVmaddr >= seg.orig_vmaddr && imageRelVmaddr < seg.orig_vmaddr + seg.orig_vmsize ) {
+            return (uintptr_t)(_arena + _hdr->regions[seg.region_idx].vm_base
+                               + seg.region_off + (imageRelVmaddr - seg.orig_vmaddr));
+        }
+    }
+    return 0;
 }
 
 // perf#24c2e: apply EVERY cached image's fixups, once, for the whole cache. Bind targets are
