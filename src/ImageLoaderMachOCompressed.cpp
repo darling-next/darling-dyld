@@ -46,6 +46,10 @@
 #include "Array.h"
 #include "DCC2Reader.h"   // perf#24c2e: DCC2 packed-cache guarded hook (flag-gated)
 
+// perf#24f-fix-elfcalls-handoff (#104): dyld-proper's func-lookup (has the DARLING __dyld_get_elfcalls
+// entry). Used only for the regression guard below.
+extern "C" int _dyld_func_lookup(const char* name, void** address);
+
 #ifndef BIND_SUBOPCODE_THREADED_SET_JOP
    #define BIND_SUBOPCODE_THREADED_SET_JOP								0x0F
 #endif
@@ -932,6 +936,21 @@ void ImageLoaderMachOCompressed::doBind(const LinkContext& context, bool forceLa
 			dcc->noteNormalBindSkipped();
 			if ( !dcc->allFixupsApplied() )
 				dyld::halt("DCC2: doBind reached for a DCC image before fixups were applied (invariant violation)");
+			// perf#24f-fix-elfcalls-handoff (#104): the normal doBind tail calls setupLazyPointerHandler,
+			// which patches each image's __DATA,__dyld section (dyldLazyBinder + dyldFuncLookup) to point
+			// into dyld proper. Skipping doBind for a DCC image ALSO skipped that patch, so libdyld's
+			// __dyld section kept its baked dyldFuncLookup and libsystem_kernel's _mach_driver_init
+			// resolved __dyld_get_elfcalls to NULL => crash (RIP=0). Run just the __dyld handoff here so a
+			// DCC-substituted image participates in the same func-lookup handoff as a disk-loaded one. The
+			// DCC image's __DATA is COW-mapped RW, so these two pointer writes are safe.
+			this->setupLazyPointerHandler(context);
+			// RED regression gate: __dyld_get_elfcalls MUST resolve non-NULL before libsystem_kernel's
+			// _mach_driver_init calls it. An explicit hard fail here beats a NULL-call RIP=0 crash later.
+			{
+				void* elfcallsGetter = nullptr;
+				if ( !_dyld_func_lookup("__dyld_get_elfcalls", &elfcallsGetter) || elfcallsGetter == nullptr )
+					dyld::halt("DCC2: __dyld_get_elfcalls lookup is NULL after DCC handoff (perf#24f-fix-elfcalls-handoff regression)");
+			}
 			CRSetCrashLogMessage2(NULL);
 			return;
 		}
