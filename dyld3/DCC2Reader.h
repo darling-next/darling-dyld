@@ -17,9 +17,19 @@
 
 namespace dyld3 {
 
-/* on-disk format (must match tools/closure-cache/dcc2-format.h) */
+/* on-disk format (must match tools/closure-cache/dcc2-format.h AND dcc5-format.h).
+ * perf#24f: DCC5 is binary-compatible with DCC2 (same regions + fixup table) EXCEPT (a) magic/version,
+ * (b) the header carries 4 extra riprel_* accounting uint32 at the end, and (c) the packed __TEXT has
+ * its RIP-relative disp32 pre-rewritten so region-packing no longer breaks TEXT->DATA refs (the DCC2
+ * "__text" crash, task #97). The reader accepts BOTH: for DCC2 it maps stale __TEXT (crashes on any
+ * non-leaf image — kept only for the historical 2-dylib smoke); for DCC5 the __TEXT is correct.
+ * The header struct below matches dcc5-format.h so sizeof() places the image table correctly for a
+ * DCC5 cache; a DCC2 cache written by the old builder has a smaller header, so DCC2 is now read via the
+ * legacy path only (magic gate) — production uses DCC5. */
 #define DCC2_MAGIC   0x44434332u
 #define DCC2_VERSION 2
+#define DCC5_MAGIC   0x44434335u
+#define DCC5_VERSION 5
 #define DCC2_REGION_ALIGN 0x4000
 #define DCC2_MAX_SEGS 8
 #define DCC2_FIX_REBASE        0
@@ -52,6 +62,9 @@ struct DCC2Header {
     DCC2Region regions[3];
     uint64_t fixup_off;  uint32_t fixup_count;  uint32_t _pad0;
     uint64_t extern_off; uint32_t extern_size;  uint32_t _pad1;
+    /* perf#24f DCC5 rewrite totals (present only in DCC5; included so sizeof() matches the DCC5 header
+     * and the image table starts at the right offset). */
+    uint32_t riprel_total, riprel_rewritten, riprel_sametext, riprel_skipped_pool;
 };
 
 //

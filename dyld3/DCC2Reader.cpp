@@ -82,8 +82,11 @@ bool DCC2Reader::validate(int fd)
     if ( m == MAP_FAILED ) return false;
     _cache = (uint8_t*)m;
     _hdr   = (DCC2Header*)_cache;
-    if ( _hdr->magic != DCC2_MAGIC )   { if(_log)_log("dyld[DCC2]: bad magic\n"); return false; }
-    if ( _hdr->version != DCC2_VERSION){ if(_log)_log("dyld[DCC2]: bad version\n"); return false; }
+    // perf#24f: accept the DCC5 cache (3-region + pre-rewritten __TEXT). The historical DCC2 cache has a
+    // smaller header and stale __TEXT (crashes on non-leaf images) — reject it so production only ever
+    // maps a rewritten cache.
+    if ( _hdr->magic != DCC5_MAGIC )     { if(_log)_log("dyld[DCC2]: bad magic (need DCC5)\n"); return false; }
+    if ( _hdr->version != DCC5_VERSION ) { if(_log)_log("dyld[DCC2]: bad version (need 5)\n"); return false; }
     _images    = (DCC2Image*)(_cache + sizeof(DCC2Header));
     _fixups    = (DCC2Fixup*)(_cache + _hdr->fixup_off);
     _externStr = (const char*)(_cache + _hdr->extern_off);
