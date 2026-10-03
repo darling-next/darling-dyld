@@ -151,10 +151,13 @@ __dyld_start:
 	movq	$0,%rbp		# restore ebp back to zero
 	jmp	*%rax		# jump to the entry point
 
+	.section __TEXT,__const
+	.text
+
 	# LC_MAIN case, set up stack for call to main()
 Lnew:	addq	$16,%rsp	# remove local variables
 	pushq	%rdi		# simulate return address into _start in libdyld
-	movq	8(%rbp),%rdi	# main param1 = argc into %rdi
+		movq	8(%rbp),%rdi	# main param1 = argc into %rdi
 	leaq	16(%rbp),%rsi	# main param2 = &argv[0] into %rsi
 	leaq	0x8(%rsi,%rdi,8),%rdx # main param3 = &env[0] into %rdx
  	movq	%rdx,%rcx

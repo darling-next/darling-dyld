@@ -127,6 +127,12 @@ extern "C" void sigexc_setup(void);
 //  This is code to bootstrap dyld.  This work in normally done for a program by dyld and crt.
 //  In dyld we have to do this manually.
 //
+
+// perf#30 (directive section 7): gated milestones for the dyld BOOTSTRAP path. Measured: dyld::_main is never
+// entered, so the death is in one of the Darling-specific steps below it -- rebaseDyld, __guard_setup,
+// sigexc_setup, _subsystem_init -- and this is the split that names which. write(2) only: no stdio here and no
+// runtime may be assumed initialised this early.
+
 uintptr_t start(const dyld3::MachOLoaded* appsMachHeader, int argc, const char* argv[],
 				const dyld3::MachOLoaded* dyldsMachHeader, uintptr_t* startGlue)
 {

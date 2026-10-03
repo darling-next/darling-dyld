@@ -6505,6 +6505,12 @@ static ClosureMode getPlatformDefaultClosureMode() {
 // sets up some registers and call this function.
 //
 // Returns address of main() in target program which __dyld_start jumps to
+// perf#30 (directive section 7): minimal, GATED milestones for the guest dyld entry. The boot reaches the
+// loader handoff and the guest then terminates with exit 0 before its main, so the last REACHED point is the
+// only question that matters. Printed with write(2) rather than stdio: this file does not include stdio.h, and
+// a minimal syscall cannot pull in a runtime that is not initialised yet.
+
+
 //
 uintptr_t
 _main(const macho_header* mainExecutableMH, uintptr_t mainExecutableSlide, 

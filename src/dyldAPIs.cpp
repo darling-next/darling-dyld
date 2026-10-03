@@ -127,6 +127,7 @@ static int sLastErrorNo;
 extern "C" int mach_driver_get_dyld_fd(void);
 extern "C" void* elfcalls_get_pointer(void);
 extern "C" void mach_driver_set_dyld_fd(int fd);
+extern "C" void __darling_reset_cached_self_ports(void);
 #endif
 
 // In 10.3.x and earlier all the NSObjectFileImage API's were implemeneted in libSystem.dylib
@@ -1288,6 +1289,10 @@ void _dyld_fork_child()
 	// in mach_init() mach_task_self_ is initialized to task_self_trap().
 	//
 	extern mach_port_t	mach_task_self_;
+#ifdef DARLING
+	// dyld embeds a separate emulation cache; libSystem's fork hook cannot reset it.
+	__darling_reset_cached_self_ports();
+#endif
 	mach_task_self_ = task_self_trap();
  	
 	// If dyld is sending load/unload notices to CoreSymbolication, the shared memory
