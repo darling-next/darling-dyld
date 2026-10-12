@@ -45,6 +45,7 @@
 #include <mach-o/dyld_images.h>
 #include <mach-o/dyld.h>
 #include <mach-o/dyld_priv.h>
+#include <mach-o/dyld_process_info.h>
 
 #include <ptrauth.h>
 
@@ -2218,40 +2219,121 @@ int dyld_shared_cache_iterate_text(const uuid_t cacheUuid, void (^callback)(cons
 
 
 //
-// dyld_for_each_installed_shared_cache
+// The dyld_introspection SPI family
+// =================================
 //
-// This is Apple's dyld_introspection SPI, and this is a port of Apple's own implementation of it,
-// not a re-derivation.  The entry point lives in libdyld_introspection/dyld_introspection.cpp and
-// the enumeration it forwards to is dyld4::Atlas::SharedCache::forEachInstalledCacheWithSystemPath()
-// in common/ProcessAtlas.cpp; the sub-cache filter is DyldSharedCache::isSubCachePath() in
-// common/DyldSharedCache.cpp.  Ported from the dyld-1125.5 tag, which is the dyld macOS 14 shipped
-// -- the version this guest reports in /System/Library/CoreServices/SystemVersion.plist (14.0,
-// 23A344) and the generation the CoreSymbolicationDT that binds this symbol was built against.
-// Apple's algorithm, kept as it stands:
+// This is APPLE'S dyld_introspection SPI, ported -- not re-derived -- from the dyld-1125.5 tag,
+// which is the dyld macOS 14 shipped: the version this guest reports in
+// /System/Library/CoreServices/SystemVersion.plist (14.0, 23A344) and the generation the
+// CoreSymbolicationDT that binds these symbols was built against.  CoreSymbolicationDT binds all
+// of them STRONG and EAGER through a chained-fixups import on the libSystem ordinal, so the loader
+// refuses the image until every one of them resolves, whether or not it is ever called.
 //
-//   * resolve each of the OS's shared-cache directories to its real path, and visit each real path
-//     once (several of the paths are symlinked views of the same directory);
-//   * list the regular files in it, skipping sub-caches (dyld_shared_cache_<arch>.NN) and
-//     auxiliary files, by Apple's suffix rule;
-//   * map each remaining file as a shared cache, and call the block with it only if it really is
-//     one -- an unrelated file in a cache directory is not reported.
+// The entry points are a port of libdyld_introspection/dyld_introspection.cpp; the semantics each
+// one carries are a port of the objects Apple's own code delegates to:
 //
-// The block's handle is a dyld_shared_cache_t, which Apple documents as valid only for the body of
-// the block; the cache is mapped for that body and unmapped again after it.  This file has no
-// Atlas layer, so the handle is this tree's own representation of an installed cache: the mapped
-// cache itself, the very object findCacheInDirAndMap() already maps and hands around for
-// dyld_shared_cache_find_iterate_text().
+//   common/ProcessAtlas.cpp          Atlas::Process / ProcessSnapshot / Image / SharedCache
+//   common/DyldSharedCache.cpp       DyldSharedCache::isSubCachePath()
+//   framework/LegacyAPIShims.mm      the null guards of the non-Atlas entry points
 //
-// ON THIS GUEST THE ENUMERATION IS MEASURED EMPTY, and the empty result is reported as such: none
-// of the directories below exists in the deployed prefix -- there is no dyld_shared_cache_* file
-// anywhere under it -- so every realpath() fails and the loop calls the block zero times.  A
-// fabricated cache, or a fabricated uuid, would be a lie; zero calls is the honest answer, and it
-// is what Apple's own code also yields for a system that has no cache installed, which is what
-// this guest is.
+// ON THE HANDLE TYPES.  Apple hands the block an object (dyld4::Atlas::Image,
+// dyld4::Atlas::SharedCache; the legacy shims hand out _DYImage / _DYSharedCache), never a raw file
+// byte pointer, because the callees reach back into it: _dyld_image_content_for_segment needs the
+// shared-cache slide and the buffer backing the image, and _dyld_image_get_file_path must answer
+// NULL for an image that lives only in the shared cache and the file path otherwise.  This tree has
+// no Atlas layer, so the same two objects are ported here over what this tree does have:
 //
-typedef struct dyld_shared_cache_s* dyld_shared_cache_t;
+//   * dyld_shared_cache_t is a mapped shared cache: the mapped DyldSharedCache (whose first
+//     member is the dyld_cache_header, so this is the very object dyld_shared_cache_find_iterate_text()
+//     maps and hands around, at the same address as before), plus where its file is mapped, the
+//     address it answers at, its unslid base and whether the mapping is private.  This mirrors
+//     Atlas::SharedCache::createForFileRecord(), which maps the cache file for the same reason.
+//   * dyld_image_t is a mapped Mach-O (Atlas Image::ml()) plus the two things a bare Mach-O pointer
+//     cannot answer: the shared-cache slide (Atlas Image::_sharedCacheSlide) and the backing file
+//     (Atlas Image::_file).  For an image from a cache the path is NULL, exactly as
+//     Atlas::Image::filename() returns, and its content is the cache mapping; for an image loaded
+//     in a process the path is the one the process's dyld_all_image_infos carries, and its content
+//     is read from that file -- Apple's contentForSegment() materializes the on-disk bytes through
+//     the file mapper, so this is that same content, not the process's patched memory.
+//   * dyld_process_t / dyld_process_snapshot_t are Apple's Process / ProcessSnapshot.  This tree's
+//     generation already ships a reader of exactly the data Apple's newer Process::getSnapshot()
+//     reads -- _dyld_process_info_create() in src/dyld_process_info.cpp reads the target's
+//     task_info(TASK_DYLD_INFO) / dyld_all_image_infos and yields the loaded images with their
+//     uuid, path and segments -- so the new SPI is ported onto that rather than re-derived.  Apple's
+//     failure values are kept: a target whose all_image_infos cannot be read gives a snapshot that
+//     is invalid (NULL out of create), a target without a dyld shared cache gives
+//     dyld_process_snapshot_get_shared_cache() NULL, and an image whose backing file is gone or
+//     whose uuid does not match answers false / NULL.
+//
+// ON THIS GUEST THE TWO DATA SOURCES ARE MEASURED ABSENT: there is no dyld shared cache anywhere in
+// the deployed prefix (no *.dsc, no dyld_shared_cache*, no com.apple.dyld; every directory below
+// fails realpath() and /System/Library/Caches is empty), and the prefix maps no cache into any
+// process, so the enumeration calls its block zero times and every cache handle is NULL.  A
+// fabricated cache, uuid or object would be a lie; zero calls is what Apple's own code yields for a
+// system with no cache installed, which is what this guest is.
+//
+typedef struct dyld_process_s*          dyld_process_t;
+typedef struct dyld_process_snapshot_s* dyld_process_snapshot_t;
+typedef struct dyld_shared_cache_s*     dyld_shared_cache_t;
+typedef struct dyld_image_s*            dyld_image_t;
 
-extern "C" void dyld_for_each_installed_shared_cache(void (^callback)(dyld_shared_cache_t cache));
+struct dyld_shared_cache_s {
+	const DyldSharedCache* cache;          // the mapped cache: its first member is the header
+	const uint8_t*                contentBase;    // where the cache file is mapped
+	uint64_t                      rebasedAddress; // Atlas SharedCache::rebasedAddress()
+	uint64_t                      unslidBase;     // Atlas SharedCache::_slide is rebasedAddress-unslidBase
+	bool                          mappedPrivate;  // Atlas SharedCache::isPrivateMapped()
+	size_t                        sizeMapped;     // non-zero when this handle owns the mapping
+};
+
+struct dyld_image_s {
+	const dyld3::MachOFile* ml;                 // Atlas Image::ml(), once resolvable
+	uint64_t                rebasedAddress;     // Atlas Image::rebasedAddress()
+	bool                    inSharedCache;      // Atlas Image::_sharedCacheSlide.has_value()
+	uint64_t                sharedCacheSlide;   // Atlas Image::_sharedCacheSlide
+	const uint8_t*          contentBase;        // cache images: the cache mapping
+	uint64_t                contentUnslidBase;  // cache images: the cache's unslid base
+	const char*             path;               // Atlas Image::filename(); NULL for a cache image
+	uuid_t                  expectedUuid;       // the uuid the process reports for this image
+	bool                    hasExpectedUuid;
+	bool                    mlResolved;
+	void*                   mappedFile;         // owned mapping, for an image that is not in a cache
+	size_t                  mappedFileSize;
+	uint64_t                fileSliceOffset;
+};
+
+struct dyld_process_s {
+	task_t            task;
+	dyld_process_info info;      // Apple's Process::_snapshot, from this tree's all_image_infos reader
+};
+
+struct dyld_process_snapshot_s {
+	dyld_process_info   info;
+	dyld_shared_cache_t cache;   // Atlas ProcessSnapshot::_sharedCache; owned, NULL when there is none
+	bool                cacheResolved;
+};
+
+extern "C" {
+void dyld_for_each_installed_shared_cache(void (^callback)(dyld_shared_cache_t cache));
+dyld_process_t dyld_process_create_for_task(task_read_t task, kern_return_t *kr);
+void dyld_process_dispose(dyld_process_t process);
+dyld_process_snapshot_t dyld_process_snapshot_create_for_process(dyld_process_t process, kern_return_t *kr);
+void dyld_process_snapshot_dispose(dyld_process_snapshot_t snapshot);
+void dyld_process_snapshot_for_each_image(dyld_process_snapshot_t snapshot, void (^block)(dyld_image_t image));
+dyld_shared_cache_t dyld_process_snapshot_get_shared_cache(dyld_process_snapshot_t snapshot);
+uint64_t dyld_shared_cache_get_base_address(dyld_shared_cache_t cache_atlas);
+uint64_t dyld_shared_cache_get_mapped_size(dyld_shared_cache_t cache_atlas);
+bool dyld_shared_cache_is_mapped_private(dyld_shared_cache_t cache_atlas);
+void dyld_shared_cache_copy_uuid(dyld_shared_cache_t cache_atlas, uuid_t *uuid);
+void dyld_shared_cache_for_each_image(dyld_shared_cache_t cache, void (^block)(dyld_image_t image));
+bool dyld_image_content_for_segment(dyld_image_t image, const char* segmentName,
+                                    void (^contentReader)(const void* content, uint64_t vmAddr, uint64_t vmSize));
+bool dyld_image_copy_uuid(dyld_image_t image, uuid_t* uuid);
+bool dyld_image_for_each_segment_info(dyld_image_t image,
+                                      void (^block)(const char* segmentName, uint64_t vmAddr, uint64_t vmSize, int perm));
+const char* dyld_image_get_installname(dyld_image_t image);
+const char* dyld_image_get_file_path(dyld_image_t image);
+}
 
 // Apple's DyldSharedCache::isSubCachePath(): a leaf name carrying any suffix other than
 // ".development" is a sub-cache or an auxiliary file, and the main cache is what is enumerated.
@@ -2275,6 +2357,7 @@ static const char* sInstalledSharedCacheDirs[] = {
 	"/private/preboot/Cryptexes/OS/System/DriverKit/System/Library/dyld/",
 	"/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/",
 	"/System/Cryptexes/OS/System/Library/dyld/",
+	"/System/Cryptexes/ExclaveOS/System/ExclaveKit/System/Library/dyld/",
 	"/System/Volumes/Preboot/Cryptexes/Incoming/OS/System/Library/dyld/",
 	"/System/Volumes/Preboot/Cryptexes/Incoming/OS/System/DriverKit/System/Library/dyld/",
 	"/private/preboot/Cryptexes/Incoming/OS/System/Library/Caches/com.apple.dyld/",
@@ -2283,10 +2366,117 @@ static const char* sInstalledSharedCacheDirs[] = {
 	"/System/Cryptexes/Incoming/OS/System/Library/dyld/",
 	"/System/Library/Caches/com.apple.dyld/",
 	"/System/DriverKit/System/Library/dyld/",
+	"/System/ExclaveKit/System/Library/dyld/",
 	"/System/Library/dyld/"
 };
 #define INSTALLED_CACHE_DIR_COUNT (sizeof(sInstalledSharedCacheDirs)/sizeof(sInstalledSharedCacheDirs[0]))
 
+// Apple maps an installed cache through a Mapper that presents the cache's own address space
+// (Mapper::mapperForSharedCache() opens the file, peeks the header, and maps each of the cache's
+// mappings at its declared address).  mapStartOfCache() above maps only the first megabyte, which
+// is all DyldSharedCache::forEachImageTextSegment() ever reads; the introspection SPI reaches image
+// content anywhere in the cache, so the whole file is mapped here -- the same view, one mapping.
+static const DyldSharedCache* mapSharedCacheFile(const char* path, size_t& sizeMapped)
+{
+	struct stat statbuf;
+	if ( dyld3::stat(path, &statbuf) == -1 )
+		return NULL;
+	if ( statbuf.st_size < 0x004000 )      // Apple's cacheFilePeek() reads a 16 KiB prefix
+		return NULL;
+	int fd = dyld3::open(path, O_RDONLY, 0);
+	if ( fd < 0 )
+		return NULL;
+	void* mapping = ::mmap(NULL, (size_t)statbuf.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+	::close(fd);
+	if ( mapping == MAP_FAILED )
+		return NULL;
+	const DyldSharedCache* cache = (const DyldSharedCache*)mapping;
+	// Apple's cacheFilePeek(): a file that does not begin with the cache magic is not a cache, and an
+	// unrelated file that happens to sit in a cache directory is not reported.
+	if ( ::strncmp(cache->header.magic, "dyld_v1", 7) != 0 ) {
+		::munmap(mapping, (size_t)statbuf.st_size);
+		return NULL;
+	}
+	sizeMapped = (size_t)statbuf.st_size;
+	return cache;
+}
+
+static dyld_shared_cache_t makeFileSharedCacheHandle(const DyldSharedCache* cache, size_t sizeMapped, bool privateMapping)
+{
+	dyld_shared_cache_t handle = (dyld_shared_cache_t)::malloc(sizeof(struct dyld_shared_cache_s));
+	if ( handle == NULL )
+		return NULL;
+	handle->cache          = cache;
+	handle->contentBase    = (const uint8_t*)cache;
+	handle->unslidBase     = cache->unslidLoadAddress();
+	// Atlas::SharedCache::createForFileRecord() maps the cache file with no slide, so such a cache
+	// answers at its own unslid base -- the base address the SPI documents for an installed cache.
+	handle->rebasedAddress = handle->unslidBase;
+	handle->mappedPrivate  = privateMapping;
+	handle->sizeMapped     = sizeMapped;
+	return handle;
+}
+
+static void disposeSharedCacheHandle(dyld_shared_cache_t handle)
+{
+	if ( handle == NULL )
+		return;
+	if ( handle->sizeMapped != 0 )
+		::munmap((void*)handle->cache, handle->sizeMapped);
+	::free(handle);
+}
+
+// Apple's mapperForSharedCache() falls back to the cache file whenever the cache in question is not
+// the one this process has mapped; this is that fallback, by the same uuid rule and over the same
+// directories the enumeration walks.
+static dyld_shared_cache_t findInstalledSharedCacheWithUUID(const uuid_t wantedUUID)
+{
+	for ( size_t i = 0; i < INSTALLED_CACHE_DIR_COUNT; ++i ) {
+		char dirRealPath[PATH_MAX];
+		if ( realpath(sInstalledSharedCacheDirs[i], dirRealPath) == NULL )
+			continue;
+		DIR* dirp = ::opendir(dirRealPath);
+		if ( dirp == NULL )
+			continue;
+		dirent entry;
+		dirent* entp = NULL;
+		char cachePath[PATH_MAX];
+		while ( ::readdir_r(dirp, &entry, &entp) == 0 ) {
+			if ( entp == NULL )
+				break;
+			if ( entp->d_type != DT_REG )
+				continue;
+			if ( isSharedCacheSubCacheLeafName(entp->d_name) )
+				continue;
+			if ( strlcpy(cachePath, dirRealPath, PATH_MAX ) >= PATH_MAX )
+				continue;
+			if ( strlcat(cachePath, entp->d_name, PATH_MAX) >= PATH_MAX )
+				continue;
+			size_t sizeMapped = 0;
+			const DyldSharedCache* cache = mapSharedCacheFile(cachePath, sizeMapped);
+			if ( cache == NULL )
+				continue;
+			uuid_t foundUUID;
+			cache->getUUID(foundUUID);
+			if ( ::memcmp(foundUUID, wantedUUID, sizeof(uuid_t)) == 0 )
+				return makeFileSharedCacheHandle(cache, sizeMapped, true);
+			::munmap((void*)cache, sizeMapped);
+		}
+		closedir(dirp);
+	}
+	return NULL;
+}
+
+// dyld_introspection.cpp:327, over Atlas SharedCache::forEachInstalledCacheWithSystemPath().  The
+// handle is valid only for the body of the block: the cache is mapped for that body and unmapped
+// again after it, exactly as Apple's ephemeral allocator owns the mapping for the block's lifetime.
+//
+// ON THIS GUEST THE ENUMERATION IS MEASURED EMPTY, and the empty result is reported as such: none
+// of the directories above exists in the deployed prefix -- there is no dyld_shared_cache_* file
+// anywhere under it -- so every realpath() fails and the loop calls the block zero times.  A
+// fabricated cache, or a fabricated uuid, would be a lie; zero calls is the honest answer, and it
+// is what Apple's own code also yields for a system that has no cache installed, which is what
+// this guest is.
 void dyld_for_each_installed_shared_cache(void (^callback)(dyld_shared_cache_t cache))
 {
 	char visitedRealPaths[INSTALLED_CACHE_DIR_COUNT][PATH_MAX];
@@ -2328,18 +2518,421 @@ void dyld_for_each_installed_shared_cache(void (^callback)(dyld_shared_cache_t c
 				continue;
 			if ( strlcat(cachePath, entp->d_name, PATH_MAX) >= PATH_MAX )
 				continue;
-			if ( const dyld_cache_header* cacheHeader = (const dyld_cache_header*)mapStartOfCache(cachePath, 0x00100000) ) {
-				if ( ::memcmp(cacheHeader, "dyld_", 5) != 0 ) {
-					// not a shared cache, unmap and look at the next file
-					::munmap((void*)cacheHeader, 0x00100000);
-					continue;
-				}
-				callback((dyld_shared_cache_t)(void*)cacheHeader);
-				::munmap((void*)cacheHeader, 0x00100000);
+			size_t sizeMapped = 0;
+			const DyldSharedCache* cache = mapSharedCacheFile(cachePath, sizeMapped);
+			if ( cache == NULL )
+				continue;
+			dyld_shared_cache_t handle = makeFileSharedCacheHandle(cache, 0, true);   // the enumeration owns the mapping
+			if ( handle != NULL ) {
+				callback(handle);
+				::free(handle);          // the mapping itself is given back below
 			}
+			::munmap((void*)cache, sizeMapped);
 		}
 		closedir(dirp);
 	}
+}
+
+//
+// Imaged backing.  Atlas Image::ml() maps an image that is not in a cache out of the file the
+// process reports for it: mapperForMachO() opens that file, and for a fat file picks the slice
+// whose uuid is the image's.  A file that is gone, or whose uuid does not match, leaves the image
+// without a Mach-O, and every accessor below then answers as Apple's does in that state.
+//
+static const dyld3::MachOFile* resolveImageMachO(dyld_image_t image)
+{
+	if ( image->mlResolved )
+		return image->ml;
+	image->mlResolved = true;
+	if ( (image->path == NULL) || (image->path[0] == '\0') || !image->hasExpectedUuid )
+		return NULL;
+	struct stat statbuf;
+	if ( dyld3::stat(image->path, &statbuf) == -1 )
+		return NULL;
+	if ( (size_t)statbuf.st_size < sizeof(mach_header_64) )
+		return NULL;
+	int fd = dyld3::open(image->path, O_RDONLY, 0);
+	if ( fd < 0 )
+		return NULL;
+	void* mapping = ::mmap(NULL, (size_t)statbuf.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+	::close(fd);
+	if ( mapping == MAP_FAILED )
+		return NULL;
+	const dyld3::MachOFile* found = NULL;
+	uint64_t sliceOffset = 0;
+	if ( const dyld3::FatFile* ff = dyld3::FatFile::isFatFile(mapping) ) {
+		Diagnostics diag;
+		__block const dyld3::MachOFile* foundByUUID = NULL;
+		__block uint64_t sliceOffsetByUUID = 0;
+		ff->forEachSlice(diag, (uint64_t)statbuf.st_size, ^(uint32_t sliceCpuType, uint32_t sliceCpuSubType, const void* sliceStart, uint64_t sliceSize, bool& stop) {
+			const dyld3::MachOFile* slice = (const dyld3::MachOFile*)sliceStart;
+			uuid_t sliceUUID;
+			if ( slice->hasMachOMagic() && slice->getUuid(sliceUUID) && (::memcmp(sliceUUID, image->expectedUuid, sizeof(uuid_t)) == 0) ) {
+				foundByUUID = slice;
+				sliceOffsetByUUID = (uint64_t)((const uint8_t*)sliceStart - (const uint8_t*)mapping);
+				stop = true;
+			}
+		});
+		diag.clearError();
+		found = foundByUUID;
+		sliceOffset = sliceOffsetByUUID;
+	} else {
+		const dyld3::MachOFile* slice = (const dyld3::MachOFile*)mapping;
+		uuid_t sliceUUID;
+		Diagnostics diag;
+		if ( slice->hasMachOMagic() && slice->isMachO(diag, (uint64_t)statbuf.st_size)
+				&& slice->getUuid(sliceUUID) && (::memcmp(sliceUUID, image->expectedUuid, sizeof(uuid_t)) == 0) )
+			found = slice;
+	}
+	if ( found == NULL ) {
+		::munmap(mapping, (size_t)statbuf.st_size);
+		return NULL;
+	}
+	image->ml              = found;
+	image->mappedFile      = mapping;
+	image->mappedFileSize  = (size_t)statbuf.st_size;
+	image->fileSliceOffset = sliceOffset;
+	return found;
+}
+
+// MachOAnalyzer::preferredLoadAddress(), which Atlas Image::forEachSegment() uses for the slide of
+// an image that is not in a cache.
+static uint64_t imagePreferredLoadAddress(const dyld3::MachOFile* mh)
+{
+	__block uint64_t textVmAddr = 0;
+	mh->forEachSegment(^(const dyld3::MachOFile::SegmentInfo& info, bool& stop) {
+		if ( ::strcmp(info.segName, "__TEXT") == 0 ) {
+			textVmAddr = info.vmAddr;
+			stop = true;
+		}
+	});
+	return textVmAddr;
+}
+
+static void initImage(dyld_image_t image)
+{
+	::memset(image, 0, sizeof(struct dyld_image_s));
+}
+
+static void disposeImage(dyld_image_t image)
+{
+	if ( image->mappedFile != NULL ) {
+		::munmap(image->mappedFile, image->mappedFileSize);
+		image->mappedFile = NULL;
+	}
+	image->ml         = NULL;
+	image->mlResolved = false;
+}
+
+// Atlas Image::forEachSegment().  An image from a cache is reported at its unslid address and one
+// loaded in a process at its loaded address; the main executable's __PAGEZERO is skipped.
+static bool forEachImageSegment(dyld_image_t image, void (^block)(const char* segmentName, uint64_t vmAddr, uint64_t vmSize, int perm))
+{
+	const dyld3::MachOFile* mh = resolveImageMachO(image);
+	if ( mh == NULL )
+		return false;
+	uint64_t slide = image->rebasedAddress - imagePreferredLoadAddress(mh);
+	mh->forEachSegment(^(const dyld3::MachOFile::SegmentInfo& info, bool& stop) {
+		uint64_t vmAddr = 0;
+		if ( image->inSharedCache ) {
+			vmAddr = info.vmAddr + image->sharedCacheSlide;
+		} else {
+			if ( mh->isMainExecutable() && (::strncmp(info.segName, "__PAGEZERO", 10) == 0) )
+				return;
+			vmAddr = info.vmAddr + slide;
+		}
+		block(info.segName, vmAddr, info.vmSize, (int)info.protections);
+	});
+	return true;
+}
+
+// Atlas Mapper::map(): the buffer backing the segment, which for an image in a cache is the cache
+// mapping and for an image in a process is the on-disk file.  Apple's Mapper::Pointer is scoped to
+// the contentReader call, and so is this pointer.
+static const void* imageSegmentContent(dyld_image_t image, const dyld3::MachOFile::SegmentInfo& info)
+{
+	if ( image->inSharedCache )
+		return image->contentBase + (info.vmAddr - image->contentUnslidBase);
+	return (const uint8_t*)image->mappedFile + image->fileSliceOffset + info.fileOffset;
+}
+
+// Atlas Image::contentForSegment().
+static bool imageContentForSegment(dyld_image_t image, const char* segmentName,
+                                   void (^contentReader)(const void* content, uint64_t vmAddr, uint64_t vmSize))
+{
+	const dyld3::MachOFile* mh = resolveImageMachO(image);
+	if ( mh == NULL )
+		return false;
+	__block bool result = false;
+	uint64_t slide = image->rebasedAddress - imagePreferredLoadAddress(mh);
+	mh->forEachSegment(^(const dyld3::MachOFile::SegmentInfo& info, bool& stop) {
+		if ( ::strcmp(segmentName, info.segName) != 0 )
+			return;
+		uint64_t vmAddr = 0;
+		if ( image->inSharedCache ) {
+			vmAddr = info.vmAddr + image->sharedCacheSlide;
+		} else {
+			if ( mh->isMainExecutable() && (::strncmp(info.segName, "__PAGEZERO", 10) == 0) )
+				return;
+			vmAddr = info.vmAddr + slide;
+		}
+		if ( info.vmSize )
+			contentReader(imageSegmentContent(image, info), vmAddr, info.vmSize);
+		else
+			contentReader(NULL, vmAddr, 0);
+		result = true;
+		stop = true;
+	});
+	return result;
+}
+
+//
+// Process.  dyld_introspection.cpp:105/119/161/182, over Atlas Process and ProcessSnapshot.  The
+// snapshot itself is this tree's own reader of the target's dyld_all_image_infos, which is the same
+// source and the same failure values Apple's newer Process::getSnapshot() reads.
+//
+dyld_process_t dyld_process_create_for_task(task_read_t task, kern_return_t *kr)
+{
+	kern_return_t krSink = KERN_SUCCESS;
+	if ( kr == NULL )
+		kr = &krSink;
+	*kr = KERN_SUCCESS;
+	// Process::Process() takes a snapshot up front and reports its error through kr; the object is
+	// returned regardless and only dyld_process_snapshot_create_for_process() needs a valid one.
+	dyld_process_info info = _dyld_process_info_create(task, 0, kr);
+	dyld_process_t result = (dyld_process_t)::malloc(sizeof(struct dyld_process_s));
+	if ( result == NULL ) {
+		if ( info != NULL )
+			_dyld_process_info_release(info);
+		*kr = KERN_NO_SPACE;
+		return NULL;
+	}
+	result->task = task;
+	result->info = info;
+	return result;
+}
+
+// dyld_introspection.cpp:119 -- UniquePtr<Process> temp((Process*)process);
+void dyld_process_dispose(dyld_process_t process)
+{
+	if ( process == NULL )
+		return;
+	if ( process->info != NULL )
+		_dyld_process_info_release(process->info);
+	::free(process);
+}
+
+// dyld_introspection.cpp:161 -- ((Process*)process)->getSnapshot(kr).release();
+dyld_process_snapshot_t dyld_process_snapshot_create_for_process(dyld_process_t process, kern_return_t *kr)
+{
+	kern_return_t krSink = KERN_SUCCESS;
+	if ( kr == NULL )
+		kr = &krSink;
+	*kr = KERN_SUCCESS;
+	// the guard framework/LegacyAPIShims.mm carries for the non-Atlas entry point
+	if ( process == NULL ) {
+		*kr = KERN_FAILURE;
+		return NULL;
+	}
+	dyld_process_info info = _dyld_process_info_create(process->task, 0, kr);
+	if ( info == NULL )
+		return NULL;
+	dyld_process_snapshot_t snapshot = (dyld_process_snapshot_t)::malloc(sizeof(struct dyld_process_snapshot_s));
+	if ( snapshot == NULL ) {
+		_dyld_process_info_release(info);
+		*kr = KERN_NO_SPACE;
+		return NULL;
+	}
+	snapshot->info          = info;
+	snapshot->cache         = NULL;
+	snapshot->cacheResolved = false;
+	return snapshot;
+}
+
+// dyld_introspection.cpp:182 -- UniquePtr<ProcessSnapshot> temp(processSnapshot);
+void dyld_process_snapshot_dispose(dyld_process_snapshot_t snapshot)
+{
+	if ( snapshot == NULL )
+		return;
+	disposeSharedCacheHandle(snapshot->cache);
+	if ( snapshot->info != NULL )
+		_dyld_process_info_release(snapshot->info);
+	::free(snapshot);
+}
+
+// dyld_introspection.cpp:192, over ProcessSnapshot::forEachImage(): every image loaded in the
+// process.  Apple's Atlas snapshot adds the shared-cache images the process has loaded from the
+// cache it maps; this tree's reader lists every image in the target's dyld_all_image_infos,
+// cache-resident ones included, and this guest maps no cache at all, so nothing is elided.
+void dyld_process_snapshot_for_each_image(dyld_process_snapshot_t snapshot, void (^block)(dyld_image_t image))
+{
+	if ( (snapshot == NULL) || (block == NULL) )
+		return;
+	if ( snapshot->info == NULL )    // Apple: a snapshot that is not valid iterates nothing
+		return;
+	_dyld_process_info_for_each_image(snapshot->info, ^(uint64_t machHeaderAddress, const uuid_t uuid, const char* path) {
+		struct dyld_image_s image;
+		initImage(&image);
+		image.rebasedAddress = machHeaderAddress;
+		image.path = ((path != NULL) && (path[0] != '\0')) ? path : NULL;
+		if ( uuid != NULL ) {
+			::memcpy(image.expectedUuid, uuid, sizeof(uuid_t));
+			for ( int i = 0; i < 16; ++i ) {
+				if ( uuid[i] != 0 ) {
+					image.hasExpectedUuid = true;
+					break;
+				}
+			}
+		}
+		block(&image);
+		disposeImage(&image);
+	});
+}
+
+// dyld_introspection.cpp:204 -- processSnapshot->sharedCache().  Apple's Atlas builds it with
+// mapperForSharedCache(): the cache this process has mapped when the uuid is that one, otherwise
+// the cache file.  A process with no cache at all answers NULL, which is this guest's answer too.
+dyld_shared_cache_t dyld_process_snapshot_get_shared_cache(dyld_process_snapshot_t snapshot)
+{
+	if ( (snapshot == NULL) || (snapshot->info == NULL) )
+		return NULL;
+	if ( !snapshot->cacheResolved ) {
+		snapshot->cacheResolved = true;
+		dyld_process_cache_info cacheInfo;
+		_dyld_process_info_get_cache(snapshot->info, &cacheInfo);
+		if ( !cacheInfo.noCache ) {
+			const DyldSharedCache* localCache = (const DyldSharedCache*)dyld3::gAllImages.cacheLoadAddress();
+			if ( localCache != NULL ) {
+				uuid_t localUUID;
+				localCache->getUUID(localUUID);
+				if ( ::memcmp(localUUID, cacheInfo.cacheUUID, sizeof(uuid_t)) == 0 ) {
+					dyld_shared_cache_t handle = (dyld_shared_cache_t)::malloc(sizeof(struct dyld_shared_cache_s));
+					if ( handle != NULL ) {
+						handle->cache          = localCache;
+						handle->contentBase    = (const uint8_t*)localCache;
+						handle->unslidBase     = localCache->unslidLoadAddress();
+						handle->rebasedAddress = (uint64_t)localCache;
+						handle->mappedPrivate  = cacheInfo.privateCache;
+						handle->sizeMapped     = 0;   // this mapping belongs to the process, not us
+						snapshot->cache = handle;
+					}
+				}
+			}
+			if ( snapshot->cache == NULL )
+				snapshot->cache = findInstalledSharedCacheWithUUID(cacheInfo.cacheUUID);
+		}
+	}
+	return snapshot->cache;
+}
+
+//
+// Shared cache.  dyld_introspection.cpp:239-300, over Atlas SharedCache.
+//
+uint64_t dyld_shared_cache_get_base_address(dyld_shared_cache_t cache_atlas)
+{
+	if ( cache_atlas == NULL )
+		return 0;
+	return cache_atlas->rebasedAddress;
+}
+
+uint64_t dyld_shared_cache_get_mapped_size(dyld_shared_cache_t cache_atlas)
+{
+	if ( cache_atlas == NULL )
+		return 0;
+	// Atlas SharedCache::size(), which is the same computation as DyldSharedCache::mappedSize()
+	return cache_atlas->cache->mappedSize();
+}
+
+bool dyld_shared_cache_is_mapped_private(dyld_shared_cache_t cache_atlas)
+{
+	if ( cache_atlas == NULL )
+		return false;
+	return cache_atlas->mappedPrivate;
+}
+
+void dyld_shared_cache_copy_uuid(dyld_shared_cache_t cache_atlas, uuid_t *uuid)
+{
+	if ( (cache_atlas == NULL) || (uuid == NULL) )
+		return;
+	// Atlas: memcpy(&uuid[0], cache->uuid().begin(), 16)
+	cache_atlas->cache->getUUID(*uuid);
+}
+
+void dyld_shared_cache_for_each_image(dyld_shared_cache_t cache, void (^block)(dyld_image_t image))
+{
+	if ( (cache == NULL) || (block == NULL) )
+		return;
+	// Atlas SharedCache::forEachImage(): one Image per dyld_cache_image_text_info, valid for the body
+	// of the block, whose content the cache's own mapping backs and whose filename() is NULL.
+	cache->cache->forEachImage(^(const mach_header* mh, const char* installName) {
+		struct dyld_image_s image;
+		initImage(&image);
+		image.ml                = (const dyld3::MachOFile*)mh;
+		image.mlResolved        = true;
+		image.inSharedCache     = true;
+		image.sharedCacheSlide  = cache->rebasedAddress - cache->unslidBase;
+		image.rebasedAddress    = cache->unslidBase + ((const uint8_t*)mh - cache->contentBase);
+		image.contentBase       = cache->contentBase;
+		image.contentUnslidBase = cache->unslidBase;
+		block(&image);
+		disposeImage(&image);
+	});
+}
+
+//
+// Image.  dyld_introspection.cpp:354-475, over Atlas Image.
+//
+bool dyld_image_content_for_segment(dyld_image_t image, const char* segmentName,
+                                    void (^contentReader)(const void* content, uint64_t vmAddr, uint64_t vmSize))
+{
+	if ( (image == NULL) || (segmentName == NULL) || (contentReader == NULL) )
+		return false;
+	return imageContentForSegment(image, segmentName, contentReader);
+}
+
+bool dyld_image_copy_uuid(dyld_image_t image, uuid_t* uuid)
+{
+	if ( (image == NULL) || (uuid == NULL) )
+		return false;
+	const dyld3::MachOFile* mh = resolveImageMachO(image);
+	if ( mh == NULL )
+		return false;
+	uuid_t imageUUID;
+	if ( !mh->getUuid(imageUUID) )    // Atlas: an image with an empty uuid answers false
+		return false;
+	::memcpy((void*)&uuid[0], imageUUID, sizeof(uuid_t));
+	return true;
+}
+
+bool dyld_image_for_each_segment_info(dyld_image_t image,
+                                      void (^block)(const char* segmentName, uint64_t vmAddr, uint64_t vmSize, int perm))
+{
+	if ( (image == NULL) || (block == NULL) )
+		return false;
+	return forEachImageSegment(image, block);
+}
+
+const char* dyld_image_get_installname(dyld_image_t image)
+{
+	if ( image == NULL )
+		return NULL;
+	const dyld3::MachOFile* mh = resolveImageMachO(image);
+	if ( mh == NULL )
+		return NULL;
+	return mh->installName();
+}
+
+const char* dyld_image_get_file_path(dyld_image_t image)
+{
+	if ( image == NULL )
+		return NULL;
+	// Atlas Image::filename(): NULL for an image that is only in the shared cache, the backing file
+	// path otherwise.
+	if ( image->inSharedCache )
+		return NULL;
+	if ( (image->path == NULL) || (image->path[0] == '\0') )
+		return NULL;
+	return image->path;
 }
 
 bool _dyld_is_memory_immutable(const void* addr, size_t length)
