@@ -3189,9 +3189,9 @@ bool _dyld_is_objc_constant(DyldObjCConstantKind kind, const void* addr) {
 // The rest of the family in libdyld/utils.cpp -- macho_arch_name_for_cpu_type(),
 // macho_arch_name_for_mach_header(), macho_for_each_slice(), macho_for_each_slice_in_fd(),
 // macho_best_slice(), macho_best_slice_in_fd(), macho_dylib_install_name() -- is NOT implemented,
-// with TWO exceptions, one per rung: macho_for_each_slice() (ported below, for
-// DVTInstrumentsFoundation) and macho_arch_name_for_cpu_type() (ported below that, for
-// DVTFoundation).
+// with THREE exceptions, one per rung: macho_for_each_slice() (ported below, for
+// DVTInstrumentsFoundation), macho_arch_name_for_cpu_type() (ported below that, for DVTFoundation)
+// and macho_arch_name_for_mach_header() (ported below that, for XCTHarness).
 //
 // CORRECTION: the sentence that used to stand here said "no image measured in this ladder's closure
 // imports any of them (SymbolicationDT's 662 imports contain exactly one macho_* name, the one
@@ -3203,21 +3203,23 @@ bool _dyld_is_objc_constant(DyldObjCConstantKind kind, const void* addr) {
 // EAGER on the libSystem ordinal (field /usr/lib/libSystem.B.dylib) --
 //
 //   DVTInstrumentsFoundation (1141 imports)   _macho_for_each_slice                  <- ported below
-//   XCTHarness                                _macho_for_each_slice
-//   XCTHarness                                _macho_arch_name_for_cpu_type
-//   XCTHarness                                _macho_arch_name_for_mach_header
-//   DVTFoundation                             _macho_arch_name_for_cpu_type
-//   AppThinning                               _macho_arch_name_for_cpu_type
+//   XCTHarness                                _macho_for_each_slice                  <- ported below
+//   XCTHarness (1490 imports)                 _macho_arch_name_for_cpu_type          <- ported below
+//   XCTHarness (1490 imports)                 _macho_arch_name_for_mach_header       <- ported below
+//   DVTFoundation                             _macho_arch_name_for_cpu_type          <- ported below
+//   AppThinning                               _macho_arch_name_for_cpu_type          <- ported below
 //
 // Ported so far, and only these: macho_for_each_slice() (the rung where DVTInstrumentsFoundation's
-// stop demanded it) and macho_arch_name_for_cpu_type() (THIS rung: the ladder's stop is
-// DVTFoundation's own __dyld_get_dlopen_image_header, and the same image binds
-// _macho_arch_name_for_cpu_type strong and eager beside it -- chained import 601 of 2261 on
-// lib_ordinal 3).  macho_arch_name_for_mach_header() is NOT ported, and neither are
-// macho_for_each_slice_in_fd(), macho_best_slice(), macho_best_slice_in_fd() or
-// macho_dylib_install_name(): the images that demand the mach_header form (XCTHarness) load PAST
-// this stop, and porting an entry point no reached image imports would be inventing surface, not
-// answering one.  SymbolicationDT is still in the closure and still carries exactly one macho_*
+// stop demanded it), macho_arch_name_for_cpu_type() (the rung whose stop was DVTFoundation's own
+// __dyld_get_dlopen_image_header, and the same image binds _macho_arch_name_for_cpu_type strong and
+// eager beside it -- chained import 601 of 2261 on lib_ordinal 3) and
+// macho_arch_name_for_mach_header() (THIS rung: the same XCTHarness that demands the cpu-type name
+// binds the mach_header form strong and eager too -- chained import 704 of 1490 on lib_ordinal 15 =
+// /usr/lib/libSystem.B.dylib, weak_import 0; see the block above that function).  The remaining
+// four names -- macho_for_each_slice_in_fd(), macho_best_slice(), macho_best_slice_in_fd(),
+// macho_dylib_install_name() -- are still unported: nothing in the closure imports them, and porting
+// an entry point no reached image imports would be inventing surface, not answering one.
+// SymbolicationDT is still in the closure and still carries exactly one macho_*
 // name, the cpu-type lookup above (662 imports, verified again in this rung's re-measurement).
 //
 
@@ -3354,14 +3356,67 @@ const char* macho_arch_name_for_cpu_type(cpu_type_t type, cpu_subtype_t subtype)
 // WHAT THIS GUEST CANNOT DO: nothing.  The answer is the table lookup above; it needs no shared
 // cache, no mapped file and no task, and the table's extent is this file's, whose two directions are
 // asserted consistent at compile time.  macho_arch_name_for_mach_header(), the third name in Apple's
-// trio, is NOT implemented: XCTHarness imports it, XCTHarness is past this rung's stop, and porting
-// an entry point no reached image demands would be inventing surface.
+// trio, is ported directly below: it is the same lookup over the SAME table, applied to the
+// type/subtype stored in the header the caller passes.
 const char* macho_arch_name_for_cpu_type(cpu_type_t type, cpu_subtype_t subtype)
 {
 	const char* result = machoArchNameForCpuType(type, subtype);
 	if ( strcmp(result, "unknown") == 0 )
 		return NULL;
 	return result;
+}
+
+
+//
+// Apple's macho_arch_name_for_mach_header()
+// =========================================
+//
+// PORTED, not re-derived, from the same dyld-1125.5 tag:
+//
+//   libdyld/utils.cpp:75        macho_arch_name_for_mach_header()
+//   include/mach-o/utils.h:100  the documented contract (macOS 13.0+):
+//     `extern const char* _Nullable macho_arch_name_for_mach_header(
+//          const struct mach_header* _Nullable mh)` -- "Returns the architecture name from the cpu
+//     type/subtype in a mach_header.  This is a convenience wrapper around
+//     macho_arch_name_for_cpu_type()."
+//
+// (The name is SPI in libdyld, NOT in libmacho: the SDK's own
+// .../MacOSX.sdk/usr/lib/system/libdyld.tbd lists _macho_arch_name_for_mach_header in its export set
+// on the same line as _macho_arch_name_for_cpu_type, while libmacho.tbd next to it lists only the
+// NX*/getsect* family.  So the wrapper belongs in this file next to its inverse, not in the tree's
+// cctools libmacho, which carries a different table.)
+//
+// WHY IT IS NEEDED.  XCTHarness's chained-fixups import table binds _macho_arch_name_for_mach_header
+// STRONG and EAGER on the libSystem ordinal (measured from the image's own bytes: chained import
+// 704 of 1490, lib_ordinal 15 = /usr/lib/libSystem.B.dylib, weak_import 0), so the loader refuses the
+// whole image until it resolves.  It is one of the names this rung's ladder stop demands.
+//
+// THE CALLER, measured rather than assumed.  Its ONE call site is 0x1b5bb, in
+// ___XCTHMachOArchitecturesForExecutable_block_invoke: the block's FIRST argument -- a real
+// `const struct mach_header*` slice handed to it by the sibling macho_for_each_slice() walk, whose
+// block descriptor reads `...?0r^{mach_header=IiiIIII}8Q16Q24^B32...` -- is moved from %rsi into
+// %rdi and passed straight here.  The image nil-tests the answer (testq %rax,%rax; je -> the block
+// returns, adding no name) and otherwise builds an NSString from the returned C string.  So NULL is
+// the honest miss and the caller's NULL path is an early return, not a hang; a made-up name would be
+// a silent wrong answer.  On this path the header is a mapped slice and never NULL; Apple's NULL
+// fallback below is ported anyway because it is the documented contract.
+//
+// WHAT THIS GUEST CAN DO: the same table lookup as the inverse beside it, reading cputype and
+// cpusubtype out of the passed header.  No fat-file walk is needed -- the header is one mapped
+// Mach-O and its cputype/cpusubtype sit at the same offsets in the 32- and 64-bit layouts.  The only
+// extra dependency is Apple's own NULL fallback, _dyld_get_prog_image_header(), which this file
+// already defines above.
+extern "C" {
+const char* macho_arch_name_for_mach_header(const struct mach_header* mh);
+}
+
+// Apple's macho_arch_name_for_mach_header() (libdyld/utils.cpp:75, dyld-1125.5), verbatim: a NULL
+// header means the process's own main executable, then the same lookup as the inverse.
+const char* macho_arch_name_for_mach_header(const struct mach_header* mh)
+{
+	if ( mh == NULL )
+		mh = _dyld_get_prog_image_header();
+	return macho_arch_name_for_cpu_type(mh->cputype, mh->cpusubtype);
 }
 
 
