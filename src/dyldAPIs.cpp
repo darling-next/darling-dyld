@@ -164,6 +164,41 @@ static void unimplemented()
 	dyld::halt("unimplemented dyld function\n");
 }
 
+//
+// Apple's dyld_priv.h:222 `_dyld_get_dlopen_image_header()`, the loader side of the libdyld wrapper
+// that was added for DVTFoundation in the same rung.  libdyld's dlopen() hands out images from THIS
+// loader when the process did not launch through a closure, and the handle it hands out is the
+// ImageLoader* itself (its low bits carry RTLD_FIRST, which dlclose() clears with `& -4`) -- an
+// encoding libdyld cannot decode, because ImageLoader is this binary's type.  So the decode belongs
+// here, exactly where Apple's own dyld/DyldAPIs.cpp has it, and libdyld reaches it through the same
+// _dyld_func_lookup() path every other loader-side API uses.
+//
+// THE CONTRACT, Apple's: the mach_header of the image the handle names.  RTLD_SELF answers with the
+// image containing the caller of the public wrapper (the depth Apple's implementation has: this
+// function is one frame below libdyld's wrapper, and the caller frame is what
+// __builtin_return_address(0) names here); RTLD_MAIN_ONLY with the main executable; and a handle
+// that is not a live image answers NULL -- the `loaderFromHandle` + `validLoader` pair's "if an
+// invalid handle passed in, return NULL", which is what a caller's nil-test is written against.
+const struct mach_header* _dyld_get_dlopen_image_header(void* handle)
+{
+	if ( dyld::gLogAPIs )
+		dyld::log("%s(%p)\n", __func__, handle);
+
+	if ( handle == RTLD_SELF ) {
+		ImageLoader* callerImage = dyld::findImageContainingAddress(__builtin_return_address(0));
+		if ( callerImage == NULL )
+			return NULL;
+		return callerImage->machHeader();
+	}
+	if ( handle == RTLD_MAIN_ONLY )
+		return dyld::mainExecutable()->machHeader();
+
+	ImageLoader* image = (ImageLoader*)(((uintptr_t)handle) & (-4));	// clear mode bits, as dlclose() does
+	if ( !dyld::validImage(image) )
+		return NULL;
+	return image->machHeader();
+}
+
 struct dyld_func {
     const char* name;
     void*		implementation;
@@ -187,6 +222,7 @@ static const struct dyld_func dyld_funcs[] = {
     {"__dyld_get_image_name",							(void*)_dyld_get_image_name },
     {"__dyld_get_image_slide",							(void*)_dyld_get_image_slide },
     {"__dyld_get_prog_image_header",					(void*)_dyld_get_prog_image_header },
+    {"__dyld_get_dlopen_image_header",					(void*)_dyld_get_dlopen_image_header },
     {"__dyld__NSGetExecutablePath",						(void*)_NSGetExecutablePath },
 
 	// SPIs

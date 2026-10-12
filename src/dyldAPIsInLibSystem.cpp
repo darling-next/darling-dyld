@@ -1392,6 +1392,67 @@ _dyld_get_prog_image_header()
     return p();
 }
 
+//
+// Apple's dyld_priv.h:222 -- `const struct mach_header* _dyld_get_dlopen_image_header(void* handle)`,
+// "Exists in Mac OS X 13.0 and later", symbol __dyld_get_dlopen_image_header.
+//
+// WHY IT IS NEEDED.  DVTFoundation's chained-fixups import table binds it STRONG and EAGER on the
+// libSystem ordinal (measured from the image's own bytes: chained import 499 of 2261, lib_ordinal 3 =
+// /usr/lib/libSystem.B.dylib, weak_import 0), so the loader refuses the whole image until it
+// resolves.  The SDK's own .../MacOSX.sdk/usr/lib/system/libdyld.tbd lists the name in libdyld's
+// export set, and this tree's /usr/lib/libSystem.B.dylib re-exports libdyld, so this file -- libdyld
+// -- is the image that must answer it.
+//
+// THE CALLER, measured rather than assumed.  Its ONE call site is 0x229b22, in
+// +[DVTAbstractMethodChecker machHeaderAddressForLoadedBundle:]: it opens the bundle's executable
+// with `dlopen(path, 0x10)` -- 0x10 is RTLD_NOLOAD, a probe of an image the process already has --
+// keeps the handle in %rbx, returns early if the handle is NULL, and otherwise passes exactly that
+// dlopen handle here, saves the answer, dlclose()s the handle, and RETURNS THE ANSWER to its caller
+// (the whole rest of the method is `movq %rbx,%rdi; callq dlclose; movq %r14,%rax; retq`).  So the
+// two shapes that must never be produced are a NULL answer for a handle this process really got from
+// dlopen (the caller's nil-test precedes the call, so the answer is used, not tested) and a
+// fabricated pointer (it is handed to -[DVTAbstractMethodChecker
+// abstractMethodRecordsInLibraryWithMachHeader:] and then to getsectiondata()).  An explicit failure
+// is the contract: NULL for a handle that is not one this process's loader issued.
+//
+// THE CONTRACT, Apple's and unchanged: the mach_header of the image the handle names; RTLD_SELF
+// answers with the image containing the caller; RTLD_MAIN_ONLY with the main executable; anything
+// else that is not a live handle answers NULL, which is what Apple's `loaderFromHandle` +
+// `validLoader` pair produces ("if an invalid `handle` passed in, return NULL").
+//
+// TWO HANDLE ENCODINGS, because this tree's dyld has Apple's two launch modes: libdyld's dlopen
+// forwards to `dyld3::dlopen_internal` when the process launched through a closure (gUseDyld3), and
+// otherwise to the loader, which hands out its own `ImageLoader*` (its low bits carry RTLD_FIRST).
+// The two are decoded by their own implementation; neither is re-derived here, and the same
+// gUseDyld3 branch is what every sibling API in this file uses.  Measured: THIS guest takes the
+// legacy path -- dyld2.cpp's default closure mode on x86_64 macOS is `PreBuiltOnly`, a closure can
+// only come from a dyld shared cache (`sSharedCacheLoadInfo.loadAddress->findClosure`), and the
+// deployed prefix holds no dyld_shared_cache* file at all -- so the frame the caller reaches is the
+// loader's implementation, and the dyld3 branch is the one Apple's own architecture requires rather
+// than one this workload exercises.
+// Declared here, not in a header: this tree's <mach-o/dyld_priv.h> is the dyld-733 generation and
+// predates the macOS 13.0 declaration, and a definition with C++ linkage would export a mangled
+// symbol the loader could never bind (the name the client's bind table asks libSystem.B for is the
+// C one, __dyld_get_dlopen_image_header).
+extern "C" {
+const struct mach_header* _dyld_get_dlopen_image_header(void* handle);
+}
+
+const struct mach_header *
+_dyld_get_dlopen_image_header(void* handle)
+{
+    if ( gUseDyld3 )
+        return dyld3::_dyld_get_dlopen_image_header(handle);
+
+    DYLD_LOCK_THIS_BLOCK;
+    typedef const struct mach_header * (*funcType)(void* handle);
+    static funcType __ptrauth_dyld_function_ptr p = NULL;
+
+    if(p == NULL)
+        dyld_func_lookup_and_resign("__dyld_get_dlopen_image_header", &p);
+    return p(handle);
+}
+
 #if DEPRECATED_APIS_SUPPORTED
 bool
 _dyld_image_containing_address(const void* address)
@@ -3110,16 +3171,27 @@ bool _dyld_is_objc_constant(DyldObjCConstantKind kind, const void* addr) {
 // answer is a table lookup.  The one honest gap is the table's own extent: Apple guards its arm64e
 // and arm64_32 entries with SUPPORT_ARCH_arm64e / SUPPORT_ARCH_arm64_32, and this tree defines
 // neither (no definition anywhere in the dyld sources, in the generated CMake text or in
-// build/verify14/build.ninja), so the ported table is the same nine-entry set the tree's own
-// dyld3/MachOFile.cpp carries, and "arm64e" gets the answer Apple's own implementation gives when
+// build/verify14/build.ninja), so "arm64e" gets the answer Apple's own implementation gives when
 // that macro is 0: false, outputs untouched.  That is stated here rather than repaired by inventing
 // a table entry Apple's implementation does not have in this build.
+//
+// CORRECTION (the rung that added the inverse below): the sentence that used to stand here said
+// "the ported table is the same nine-entry set the tree's own dyld3/MachOFile.cpp carries".  It is
+// NOT, and a reader who wired the inverse to MachOFile::archName() on the strength of it would
+// silently lose four architectures: read with the guards as this build resolves them, the table in
+// this file carries ELEVEN entries (x86_64, x86_64h, i386, arm64, armv7k, armv7s, armv7, armv6m,
+// armv7m, armv7em, armv8m) while dyld3/MachOFile.cpp's _s_archInfos[] carries SEVEN -- the four
+// armv6m/armv7m/armv7em/armv8m rows exist here (they are rows of the dyld-1125.5 table this block is
+// ported from) and not there.  That difference is why the inverse below reads THIS table: one name's
+// two directions must not answer two different sets, and the compile-time check beside the table is
+// what keeps that true.
 //
 // The rest of the family in libdyld/utils.cpp -- macho_arch_name_for_cpu_type(),
 // macho_arch_name_for_mach_header(), macho_for_each_slice(), macho_for_each_slice_in_fd(),
 // macho_best_slice(), macho_best_slice_in_fd(), macho_dylib_install_name() -- is NOT implemented,
-// with ONE exception added by the rung after the one that wrote this block: macho_for_each_slice()
-// (ported below).
+// with TWO exceptions, one per rung: macho_for_each_slice() (ported below, for
+// DVTInstrumentsFoundation) and macho_arch_name_for_cpu_type() (ported below that, for
+// DVTFoundation).
 //
 // CORRECTION: the sentence that used to stand here said "no image measured in this ladder's closure
 // imports any of them (SymbolicationDT's 662 imports contain exactly one macho_* name, the one
@@ -3137,14 +3209,16 @@ bool _dyld_is_objc_constant(DyldObjCConstantKind kind, const void* addr) {
 //   DVTFoundation                             _macho_arch_name_for_cpu_type
 //   AppThinning                               _macho_arch_name_for_cpu_type
 //
-// Only macho_for_each_slice() is ported, and only it: the ladder's current stop is
-// DVTInstrumentsFoundation (dlopen(@rpath/libxcodebuildLoader.dylib) aborts on its first
-// unsatisfied libSystem bind, which is __launch_service_stats_copy_impl), and for_each_slice is the
-// one macho_* name that image's import table demands.  The arch_name_* pair belongs to images that
-// load LATER (XCTHarness/DVTFoundation/AppThinning are past the stop) and is left unimplemented
-// exactly as before; SymbolicationDT is still in the closure and still carries exactly one macho_*
-// name, the cpu-type lookup above (662 imports, verified again in the same re-measurement).  Porting
-// an entry point no reached image imports would be inventing surface, not answering one.
+// Ported so far, and only these: macho_for_each_slice() (the rung where DVTInstrumentsFoundation's
+// stop demanded it) and macho_arch_name_for_cpu_type() (THIS rung: the ladder's stop is
+// DVTFoundation's own __dyld_get_dlopen_image_header, and the same image binds
+// _macho_arch_name_for_cpu_type strong and eager beside it -- chained import 601 of 2261 on
+// lib_ordinal 3).  macho_arch_name_for_mach_header() is NOT ported, and neither are
+// macho_for_each_slice_in_fd(), macho_best_slice(), macho_best_slice_in_fd() or
+// macho_dylib_install_name(): the images that demand the mach_header form (XCTHarness) load PAST
+// this stop, and porting an entry point no reached image imports would be inventing surface, not
+// answering one.  SymbolicationDT is still in the closure and still carries exactly one macho_*
+// name, the cpu-type lookup above (662 imports, verified again in this rung's re-measurement).
 //
 
 // Apple's MachOFile::_s_archInfos[] (common/MachOFile.cpp, dyld-1125.5), verbatim -- including its
@@ -3155,7 +3229,8 @@ struct MachOArchInfo {
 	uint32_t    cpusubtype;
 };
 
-static const MachOArchInfo sMachOArchInfos[] = {
+// constexpr, not merely const, so the round-trip check below can be a compile-time assertion.
+static constexpr MachOArchInfo sMachOArchInfos[] = {
 	{ "x86_64",   CPU_TYPE_X86_64,   CPU_SUBTYPE_X86_64_ALL  },
 	{ "x86_64h",  CPU_TYPE_X86_64,   CPU_SUBTYPE_X86_64_H    },
 	{ "i386",     CPU_TYPE_I386,     CPU_SUBTYPE_I386_ALL    },
@@ -3199,6 +3274,94 @@ bool macho_cpu_type_for_arch_name(const char* archName, cpu_type_t* type, cpu_su
 bool macho_cpu_type_for_arch_name(const char* archName, cpu_type_t* type, cpu_subtype_t* subtype)
 {
 	return machoCPUTypeFromArchName(archName, type, subtype);
+}
+
+
+//
+// Apple's macho_* Mach-O SPI: the inverse lookup, and the two directions' agreement
+// ================================================================================
+//
+// PORTED, not re-derived, from the same dyld-1125.5 tag:
+//
+//   libdyld/utils.cpp:65        macho_arch_name_for_cpu_type()
+//   common/MachOFile.cpp:556    MachOFile::archName()
+//   include/mach-o/utils.h:52   the documented contract (macOS 13.0+)
+//
+// (The name is SPI in libdyld, NOT in libmacho: the SDK's own
+// .../MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/lib/system/libdyld.tbd lists
+// _macho_arch_name_for_cpu_type in its export set, while libmacho.tbd next to it lists only the
+// NX*/getsect* family.  So the inverse belongs in the same file as macho_cpu_type_for_arch_name and
+// macho_for_each_slice above -- the tree's libmacho (src/external/cctools) is the cctools arch
+// table, a different image with a different table, and answering from there would be a second
+// convention for one name.)
+//
+// WHY IT IS NEEDED.  DVTFoundation's chained-fixups import table binds _macho_arch_name_for_cpu_type
+// STRONG and EAGER on the libSystem ordinal (measured from the image's own bytes: chained import
+// 601 of 2261, lib_ordinal 3 = /usr/lib/libSystem.B.dylib, weak_import 0), so the loader refuses the
+// whole image until it resolves.  Its ONE call site is 0x161bad, in
+// ___DVTMachOArchitecturesForExecutable_block_invoke, with the fat slice's own cputype/cpusubtype
+// from the loop (movl -0x2c(%rbp),%edi; movl %r12d,%esi); the image nil-tests the returned pointer
+// (testq %rax,%rax; je -> the _unknownArchError path) and otherwise builds an NSString from the C
+// string with NSUTF8StringEncoding (movl $0x4,%ecx; %rdx = the returned name).  NULL is therefore the
+// honest miss and a made-up name would be a silent wrong answer.
+//
+// THE TWO DIRECTIONS MUST AGREE.  Matching is not symmetric -- the name side compares the name
+// exactly and the type side masks the ABI bits off the subtype -- so name -> pair -> name holds only
+// when (a) no stored subtype has ABI bits that the type side would mask away, and (b) no two entries
+// match the same pair.  Both are properties of the table alone and are asserted here, so an edit
+// that broke the inverse fails this build instead of answering the two callers differently:
+//
+constexpr bool machoArchInfosRoundTrip()
+{
+	const size_t count = sizeof(sMachOArchInfos) / sizeof(sMachOArchInfos[0]);
+	for (size_t i = 0; i < count; ++i) {
+		// (a) the pair the name side hands out must survive the type side's masking unchanged
+		if ( (sMachOArchInfos[i].cpusubtype & ~CPU_SUBTYPE_MASK) != sMachOArchInfos[i].cpusubtype )
+			return false;
+		for (size_t j = i + 1; j < count; ++j) {
+			// (b) two names must never answer the same pair, or the inverse could pick the other one
+			if ( (sMachOArchInfos[i].cputype == sMachOArchInfos[j].cputype)
+			  && (sMachOArchInfos[i].cpusubtype == (sMachOArchInfos[j].cpusubtype & ~CPU_SUBTYPE_MASK)) )
+				return false;
+		}
+	}
+	return true;
+}
+static_assert(machoArchInfosRoundTrip(), "the arch-name table's two directions would disagree");
+
+// Apple's MachOFile::archName() (common/MachOFile.cpp:556, dyld-1125.5), over THIS file's table --
+// which is what makes the agreement above a property of the build rather than of inspection.  It
+// answers Apple's sentinel "unknown" on the miss (the wrapper below translates that into NULL) and
+// masks the ABI bits off the passed subtype, which is the reason a fat slice carrying
+// CPU_SUBTYPE_LIB64 (0x80000003 for x86_64) still answers "x86_64".
+static const char* machoArchNameForCpuType(cpu_type_t cputype, cpu_subtype_t cpusubtype)
+{
+	for (const MachOArchInfo& info : sMachOArchInfos) {
+		if ( (cputype == (cpu_type_t)info.cputype) && (((uint32_t)cpusubtype & ~CPU_SUBTYPE_MASK) == info.cpusubtype) )
+			return info.name;
+	}
+	return "unknown";
+}
+
+extern "C" {
+const char* macho_arch_name_for_cpu_type(cpu_type_t type, cpu_subtype_t subtype);
+}
+
+// Apple's macho_arch_name_for_cpu_type() (libdyld/utils.cpp:65, dyld-1125.5): the lookup above with
+// the sentinel translated, so everything the table cannot answer -- an unknown name, and a pair its
+// guards exclude, such as arm64e in this configuration -- answers NULL.
+//
+// WHAT THIS GUEST CANNOT DO: nothing.  The answer is the table lookup above; it needs no shared
+// cache, no mapped file and no task, and the table's extent is this file's, whose two directions are
+// asserted consistent at compile time.  macho_arch_name_for_mach_header(), the third name in Apple's
+// trio, is NOT implemented: XCTHarness imports it, XCTHarness is past this rung's stop, and porting
+// an entry point no reached image demands would be inventing surface.
+const char* macho_arch_name_for_cpu_type(cpu_type_t type, cpu_subtype_t subtype)
+{
+	const char* result = machoArchNameForCpuType(type, subtype);
+	if ( strcmp(result, "unknown") == 0 )
+		return NULL;
+	return result;
 }
 
 

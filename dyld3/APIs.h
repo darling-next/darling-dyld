@@ -84,6 +84,8 @@ const char* _dyld_get_image_name(uint32_t imageIndex) TEMP_HIDDEN;
 
 const struct mach_header * _dyld_get_prog_image_header() TEMP_HIDDEN;
 
+const struct mach_header* _dyld_get_dlopen_image_header(void* handle) TEMP_HIDDEN;
+
 int32_t NSVersionOfLinkTimeLibrary(const char* libraryName) TEMP_HIDDEN;
 
 int32_t NSVersionOfRunTimeLibrary(const char* libraryName) TEMP_HIDDEN;

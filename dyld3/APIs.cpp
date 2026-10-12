@@ -1180,6 +1180,42 @@ void* dlsym_internal(void* handle, const char* symbolName, void* callerAddress)
     log_apis("   dlsym() => NULL\n");
     return nullptr;
 }
+
+// Apple's dyld/DyldAPIs.cpp:161 APIs::_dyld_get_dlopen_image_header() (dyld-1125.5), over this
+// tree's dyld3 handle encoding: the exact inverse of makeDlHandle() above, and validated the way
+// dlsym() and dlclose() validate a handle -- by asking the image list whether it holds that load
+// address.  It is the branch libdyld's public wrapper takes when the process launched through a
+// closure (gUseDyld3); the other mode's handle is the loader's ImageLoader*, which is decoded in
+// src/dyldAPIs.cpp where that type lives.  Both must answer the same way for a handle their own
+// dlopen issued, and neither may fabricate: an invalid handle returns nullptr, which is what
+// Apple's `loaderFromHandle` + `validLoader` pair returns and what the client's nil-test expects.
+const struct mach_header* _dyld_get_dlopen_image_header(void* handle)
+{
+    log_apis("_dyld_get_dlopen_image_header(%p)\n", handle);
+
+    if ( handle == RTLD_SELF ) {
+        // the image containing this call's caller -- the same frame depth Apple's implementation
+        // has (this function is one frame below libdyld's public wrapper)
+        __block const struct mach_header* result = nullptr;
+        gAllImages.infoForImageMappedAt(__builtin_return_address(0), ^(const LoadedImage& foundImage, uint8_t permissions) {
+            result = foundImage.loadedAddress();
+        });
+        return result;
+    }
+    if ( handle == RTLD_MAIN_ONLY )
+        return (const struct mach_header*)gAllImages.mainExecutable();
+
+    const MachOLoaded* mh;
+    bool               dontContinue;
+    parseDlHandle(handle, &mh, &dontContinue);
+    __block bool found = false;
+    gAllImages.infoForImageWithLoadAddress(mh, ^(const LoadedImage& foundImage) {
+        found = true;
+    });
+    if ( !found )
+        return nullptr;
+    return (const struct mach_header*)mh;
+}
 #endif // !TARGET_OS_DRIVERKIT
 
 
