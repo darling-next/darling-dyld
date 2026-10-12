@@ -38,6 +38,7 @@
 #include <dirent.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/errno.h>
 #include <fcntl.h>
 #include <System/sys/codesign.h>
 #include <libc_private.h>
@@ -3116,10 +3117,34 @@ bool _dyld_is_objc_constant(DyldObjCConstantKind kind, const void* addr) {
 //
 // The rest of the family in libdyld/utils.cpp -- macho_arch_name_for_cpu_type(),
 // macho_arch_name_for_mach_header(), macho_for_each_slice(), macho_for_each_slice_in_fd(),
-// macho_best_slice(), macho_best_slice_in_fd(), macho_dylib_install_name() -- is NOT implemented:
-// no image measured in this ladder's closure imports any of them (SymbolicationDT's 662 imports
-// contain exactly one macho_* name, the one below; CoreSymbolicationDT and MallocStackLoggingDT
-// import none).  Porting an unimported entry point would be inventing surface, not answering one.
+// macho_best_slice(), macho_best_slice_in_fd(), macho_dylib_install_name() -- is NOT implemented,
+// with ONE exception added by the rung after the one that wrote this block: macho_for_each_slice()
+// (ported below).
+//
+// CORRECTION: the sentence that used to stand here said "no image measured in this ladder's closure
+// imports any of them (SymbolicationDT's 662 imports contain exactly one macho_* name, the one
+// below; CoreSymbolicationDT and MallocStackLoggingDT import none)".  That measurement HAS NOW
+// CHANGED and the sentence was false, so it is corrected rather than kept.  Re-measured 2026-10-12
+// from the coverage graph entered at the guest's own run log (closure_analyze.py --cover, 254
+// reached images, every import decoded from each image's own chained-fixups/bind bytes): the
+// closure now contains THREE macho_* importers, not one, and every name below is bound STRONG and
+// EAGER on the libSystem ordinal (field /usr/lib/libSystem.B.dylib) --
+//
+//   DVTInstrumentsFoundation (1141 imports)   _macho_for_each_slice                  <- ported below
+//   XCTHarness                                _macho_for_each_slice
+//   XCTHarness                                _macho_arch_name_for_cpu_type
+//   XCTHarness                                _macho_arch_name_for_mach_header
+//   DVTFoundation                             _macho_arch_name_for_cpu_type
+//   AppThinning                               _macho_arch_name_for_cpu_type
+//
+// Only macho_for_each_slice() is ported, and only it: the ladder's current stop is
+// DVTInstrumentsFoundation (dlopen(@rpath/libxcodebuildLoader.dylib) aborts on its first
+// unsatisfied libSystem bind, which is __launch_service_stats_copy_impl), and for_each_slice is the
+// one macho_* name that image's import table demands.  The arch_name_* pair belongs to images that
+// load LATER (XCTHarness/DVTFoundation/AppThinning are past the stop) and is left unimplemented
+// exactly as before; SymbolicationDT is still in the closure and still carries exactly one macho_*
+// name, the cpu-type lookup above (662 imports, verified again in the same re-measurement).  Porting
+// an entry point no reached image imports would be inventing surface, not answering one.
 //
 
 // Apple's MachOFile::_s_archInfos[] (common/MachOFile.cpp, dyld-1125.5), verbatim -- including its
@@ -3174,4 +3199,99 @@ bool macho_cpu_type_for_arch_name(const char* archName, cpu_type_t* type, cpu_su
 bool macho_cpu_type_for_arch_name(const char* archName, cpu_type_t* type, cpu_subtype_t* subtype)
 {
 	return machoCPUTypeFromArchName(archName, type, subtype);
+}
+
+
+//
+// Apple's macho_* Mach-O SPI: iterating the slices of a file
+// =========================================================
+//
+// PORTED from the dyld-1125.5 tag, the same generation the cpu-type lookup above came from:
+//
+//   libdyld/utils.cpp:82      macho_for_each_slice()
+//   libdyld/utils.cpp:93      macho_for_each_slice_in_fd()   (the body, made private here)
+//   common/MachOFile.cpp:122  FatFile::isFatFile()           (this tree's dyld3/MachOFile.cpp:88)
+//   common/MachOFile.cpp:160  FatFile::forEachSlice()        (this tree's dyld3/MachOFile.cpp:122)
+//   common/MachOFile.cpp:988  MachOFile::isMachO()           (this tree's dyld3/MachOFile.cpp:737)
+//   include/mach-o/utils.h:111  the documented contract (macOS 13.0+)
+//
+// WHY IT IS NEEDED.  DVTInstrumentsFoundation's chained-fixups import table binds
+// _macho_for_each_slice STRONG and EAGER on the libSystem ordinal (measured from the image's own
+// 1141-import table: lib_ordinal 33 = /usr/lib/libSystem.B.dylib, weak_import 0), so the loader
+// refuses the whole image until it resolves, whether or not it is ever called -- this is the rung
+// the coverage graph's predicted stop 6 names.  The image has TWO call sites of it (0x7c884 in the
+// 0x7c8xx cluster and the XCTHarness/XCTestCore path), both passing a path and a block and treating
+// a non-zero return as an errno for strerror().
+//
+// THE CONTRACT, Apple's and unchanged: open() the path, mmap() it, and call the block once per
+// slice -- once with the whole mapping when the file is a thin Mach-O, once per architecture (in
+// fat-header order) when it is universal; the block's *stop halts the walk.  Return 0 on success,
+// else an errno value: ENOENT/EACCES from open, errno from fstat/mmap, EFTYPE when it is neither a
+// fat nor a Mach-O file, EBADMACHO when it is fat but malformed.  A NULL block is allowed and turns
+// the call into a "is this a mach-o or fat file?" predicate.
+//
+// WHAT THIS GUEST CAN DO: everything the contract asks.  The walk is pure file parsing over the
+// tree's own dyld3::FatFile / dyld3::MachOFile (the very classes dyld3/MachOFile.cpp compiles into
+// this same libdyld and that resolveImageMachO() above already drives), needs no shared cache and no
+// task, and answers from the bytes it maps.  Unlike the cpu-type lookup there is no table whose
+// extent this configuration truncates, so nothing about the ported body is conditionally compiled.
+//
+// Only this ONE entry point is ported.  macho_for_each_slice_in_fd() is a second exported name in
+// Apple's libdyld, but no image in this ladder's closure imports it, so the fd body is a static
+// helper here (not a symbol) and no second public surface is invented.
+
+extern "C" {
+int macho_for_each_slice(const char* path, void (^callback)(const struct mach_header* slice, uint64_t fileOffset, size_t size, bool* stop));
+}
+
+// Apple's macho_for_each_slice_in_fd() (libdyld/utils.cpp:93, dyld-1125.5), verbatim except that it
+// is static here (see above).  `callback` is Apple's block, whose stop parameter is a bool* rather
+// than the bool& FatFile::forEachSlice() hands its block; the bridge below takes the address of the
+// reference, which is what lets a stop set inside the loop end the walk.
+static int machoForEachSliceInFd(int fd, void (^callback)(const struct mach_header* slice, uint64_t fileOffset, size_t size, bool* stop))
+{
+	struct stat statbuf;
+	if ( ::fstat(fd, &statbuf) == -1 )
+		return errno;
+
+	const void* mappedFile = ::mmap(NULL, (size_t)statbuf.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+	if ( mappedFile == MAP_FAILED )
+		return errno;
+
+	int result = 0;
+	Diagnostics diag;
+	if ( const dyld3::FatFile* ff = dyld3::FatFile::isFatFile(mappedFile) ) {
+		ff->forEachSlice(diag, (uint64_t)statbuf.st_size, ^(uint32_t sliceCpuType, uint32_t sliceCpuSubType, const void* sliceStart, uint64_t sliceSize, bool& stop) {
+			size_t sliceOffset = (size_t)((const uint8_t*)sliceStart - (const uint8_t*)mappedFile);
+			if ( callback )
+				callback((const struct mach_header*)sliceStart, (uint64_t)sliceOffset, (size_t)sliceSize, &stop);
+		});
+		if ( diag.hasError() )
+			result = EBADMACHO;
+	}
+	else if ( ((const dyld3::MachOFile*)mappedFile)->isMachO(diag, (uint64_t)statbuf.st_size) ) {
+		bool stop = false;
+		if ( callback )
+			callback((const struct mach_header*)mappedFile, 0, (size_t)statbuf.st_size, &stop);
+	}
+	else {
+		// not a fat file nor a mach-o file
+		result = EFTYPE;
+	}
+
+	::munmap((void*)mappedFile, (size_t)statbuf.st_size);
+	return result;
+}
+
+// Apple's macho_for_each_slice() (libdyld/utils.cpp:82, dyld-1125.5): the path-taking half is
+// nothing but open() + the fd body + close(), with open()'s errno passed straight through.
+int macho_for_each_slice(const char* path, void (^callback)(const struct mach_header* slice, uint64_t fileOffset, size_t size, bool* stop))
+{
+	int fd = dyld3::open(path, O_RDONLY, 0);
+	if ( fd == -1 )
+		return errno;
+
+	int result = machoForEachSliceInFd(fd, callback);
+	::close(fd);
+	return result;
 }
