@@ -2217,6 +2217,131 @@ int dyld_shared_cache_iterate_text(const uuid_t cacheUuid, void (^callback)(cons
 }
 
 
+//
+// dyld_for_each_installed_shared_cache
+//
+// This is Apple's dyld_introspection SPI, and this is a port of Apple's own implementation of it,
+// not a re-derivation.  The entry point lives in libdyld_introspection/dyld_introspection.cpp and
+// the enumeration it forwards to is dyld4::Atlas::SharedCache::forEachInstalledCacheWithSystemPath()
+// in common/ProcessAtlas.cpp; the sub-cache filter is DyldSharedCache::isSubCachePath() in
+// common/DyldSharedCache.cpp.  Ported from the dyld-1125.5 tag, which is the dyld macOS 14 shipped
+// -- the version this guest reports in /System/Library/CoreServices/SystemVersion.plist (14.0,
+// 23A344) and the generation the CoreSymbolicationDT that binds this symbol was built against.
+// Apple's algorithm, kept as it stands:
+//
+//   * resolve each of the OS's shared-cache directories to its real path, and visit each real path
+//     once (several of the paths are symlinked views of the same directory);
+//   * list the regular files in it, skipping sub-caches (dyld_shared_cache_<arch>.NN) and
+//     auxiliary files, by Apple's suffix rule;
+//   * map each remaining file as a shared cache, and call the block with it only if it really is
+//     one -- an unrelated file in a cache directory is not reported.
+//
+// The block's handle is a dyld_shared_cache_t, which Apple documents as valid only for the body of
+// the block; the cache is mapped for that body and unmapped again after it.  This file has no
+// Atlas layer, so the handle is this tree's own representation of an installed cache: the mapped
+// cache itself, the very object findCacheInDirAndMap() already maps and hands around for
+// dyld_shared_cache_find_iterate_text().
+//
+// ON THIS GUEST THE ENUMERATION IS MEASURED EMPTY, and the empty result is reported as such: none
+// of the directories below exists in the deployed prefix -- there is no dyld_shared_cache_* file
+// anywhere under it -- so every realpath() fails and the loop calls the block zero times.  A
+// fabricated cache, or a fabricated uuid, would be a lie; zero calls is the honest answer, and it
+// is what Apple's own code also yields for a system that has no cache installed, which is what
+// this guest is.
+//
+typedef struct dyld_shared_cache_s* dyld_shared_cache_t;
+
+extern "C" void dyld_for_each_installed_shared_cache(void (^callback)(dyld_shared_cache_t cache));
+
+// Apple's DyldSharedCache::isSubCachePath(): a leaf name carrying any suffix other than
+// ".development" is a sub-cache or an auxiliary file, and the main cache is what is enumerated.
+static bool isSharedCacheSubCacheLeafName(const char* leafName)
+{
+	const char* firstDot = strchr(leafName, '.');
+	// check for files with a suffix, to know whether or not they are sub-caches
+	if ( firstDot != NULL ) {
+		// skip files that are not of the format "<baseName>.development", as they are sub-caches
+		if ( strcmp(firstDot, ".development") != 0 )
+			return true;
+	}
+	return false;
+}
+
+// The cache directories Apple searches, in Apple's order (common/ProcessAtlas.cpp, dyld-1125.5).
+static const char* sInstalledSharedCacheDirs[] = {
+	"/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/",
+	"/System/Volumes/Preboot/Cryptexes/OS/System/DriverKit/System/Library/dyld/",
+	"/private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld/",
+	"/private/preboot/Cryptexes/OS/System/DriverKit/System/Library/dyld/",
+	"/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/",
+	"/System/Cryptexes/OS/System/Library/dyld/",
+	"/System/Volumes/Preboot/Cryptexes/Incoming/OS/System/Library/dyld/",
+	"/System/Volumes/Preboot/Cryptexes/Incoming/OS/System/DriverKit/System/Library/dyld/",
+	"/private/preboot/Cryptexes/Incoming/OS/System/Library/Caches/com.apple.dyld/",
+	"/private/preboot/Cryptexes/Incoming/OS/System/DriverKit/System/Library/dyld/",
+	"/System/Cryptexes/Incoming/OS/System/Library/Caches/com.apple.dyld/",
+	"/System/Cryptexes/Incoming/OS/System/Library/dyld/",
+	"/System/Library/Caches/com.apple.dyld/",
+	"/System/DriverKit/System/Library/dyld/",
+	"/System/Library/dyld/"
+};
+#define INSTALLED_CACHE_DIR_COUNT (sizeof(sInstalledSharedCacheDirs)/sizeof(sInstalledSharedCacheDirs[0]))
+
+void dyld_for_each_installed_shared_cache(void (^callback)(dyld_shared_cache_t cache))
+{
+	char visitedRealPaths[INSTALLED_CACHE_DIR_COUNT][PATH_MAX];
+	size_t visitedCount = 0;
+
+	for ( size_t i = 0; i < INSTALLED_CACHE_DIR_COUNT; ++i ) {
+		char systemCacheDirRealPath[PATH_MAX];
+		if ( realpath(sInstalledSharedCacheDirs[i], systemCacheDirRealPath) == NULL )
+			continue;
+
+		// several of the directories above are symlinked views of one another: visit each real
+		// directory once
+		bool alreadyVisited = false;
+		for ( size_t j = 0; j < visitedCount; ++j ) {
+			if ( strcmp(visitedRealPaths[j], systemCacheDirRealPath) == 0 ) {
+				alreadyVisited = true;
+				break;
+			}
+		}
+		if ( alreadyVisited )
+			continue;
+		strlcpy(visitedRealPaths[visitedCount], systemCacheDirRealPath, PATH_MAX);
+		++visitedCount;
+
+		DIR* dirp = ::opendir(systemCacheDirRealPath);
+		if ( dirp == NULL )
+			continue;
+		dirent entry;
+		dirent* entp = NULL;
+		char cachePath[PATH_MAX];
+		while ( ::readdir_r(dirp, &entry, &entp) == 0 ) {
+			if ( entp == NULL )
+				break;
+			if ( entp->d_type != DT_REG )
+				continue;
+			if ( isSharedCacheSubCacheLeafName(entp->d_name) )
+				continue;
+			if ( strlcpy(cachePath, systemCacheDirRealPath, PATH_MAX) >= PATH_MAX )
+				continue;
+			if ( strlcat(cachePath, entp->d_name, PATH_MAX) >= PATH_MAX )
+				continue;
+			if ( const dyld_cache_header* cacheHeader = (const dyld_cache_header*)mapStartOfCache(cachePath, 0x00100000) ) {
+				if ( ::memcmp(cacheHeader, "dyld_", 5) != 0 ) {
+					// not a shared cache, unmap and look at the next file
+					::munmap((void*)cacheHeader, 0x00100000);
+					continue;
+				}
+				callback((dyld_shared_cache_t)(void*)cacheHeader);
+				::munmap((void*)cacheHeader, 0x00100000);
+			}
+		}
+		closedir(dirp);
+	}
+}
+
 bool _dyld_is_memory_immutable(const void* addr, size_t length)
 {
 	if ( gUseDyld3 )
