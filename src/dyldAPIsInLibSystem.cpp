@@ -3074,3 +3074,104 @@ bool _dyld_is_objc_constant(DyldObjCConstantKind kind, const void* addr) {
     }
     return false;
 }
+
+
+//
+// Apple's macho_* Mach-O SPI: the architecture-name lookup
+// =======================================================
+//
+// PORTED, not re-derived, from the dyld-1125.5 tag -- the generation the macOS 14 guest reports in
+// /System/Library/CoreServices/SystemVersion.plist (14.0, 23A344) and the one the SymbolicationDT
+// that binds this name was built against:
+//
+//   libdyld/utils.cpp:56        macho_cpu_type_for_arch_name()
+//   common/MachOFile.cpp:566    MachOFile::cpuTypeFromArchName()
+//   common/MachOFile.cpp:476    MachOFile::_s_archInfos[]
+//   include/mach-o/utils.h:59   the documented contract (macOS 13.0+)
+//
+// WHY IT IS NEEDED.  SymbolicationDT's chained-fixups import table binds _macho_cpu_type_for_arch_name
+// STRONG and EAGER on the libSystem ordinal (this tree's /usr/lib/libSystem.B.dylib re-exports
+// libdyld.dylib), so the loader refuses the whole image until it resolves, whether or not it is ever
+// called.  Measured from the image's own bytes rather than counted by hand
+// (llvm-objdump --macho --arch=x86_64 --chained-fixups on that framework): 662 imports, of which
+// this one is the ONLY macho_* name, bound strong (weak_import 0) to lib_ordinal 13 =
+// /usr/lib/libSystem.B.dylib.  Its one call site in the image is 0x37ba3, which feeds it a name and
+// two out parameters.
+//
+// THE CONTRACT, Apple's and unchanged: a name that is known fills in type/subtype and returns true;
+// a name that is UNKNOWN returns false and leaves the two out parameters UNTOUCHED.  The miss path
+// not writing is the validation this port must carry -- the call site pre-zeroes the two 32-bit
+// slots (xorl/movl at 0x37b3c-0x37b41) and branches on %al (testb/je at 0x37ba8-0x37baa), so a
+// made-up type written on the miss path would silently turn its "unknown architecture" branch into
+// a false positive.  Apple's loop writes only inside the match.
+//
+// WHAT THIS GUEST CANNOT DO: nothing here needs a shared cache, a mapped file or a task -- the
+// answer is a table lookup.  The one honest gap is the table's own extent: Apple guards its arm64e
+// and arm64_32 entries with SUPPORT_ARCH_arm64e / SUPPORT_ARCH_arm64_32, and this tree defines
+// neither (no definition anywhere in the dyld sources, in the generated CMake text or in
+// build/verify14/build.ninja), so the ported table is the same nine-entry set the tree's own
+// dyld3/MachOFile.cpp carries, and "arm64e" gets the answer Apple's own implementation gives when
+// that macro is 0: false, outputs untouched.  That is stated here rather than repaired by inventing
+// a table entry Apple's implementation does not have in this build.
+//
+// The rest of the family in libdyld/utils.cpp -- macho_arch_name_for_cpu_type(),
+// macho_arch_name_for_mach_header(), macho_for_each_slice(), macho_for_each_slice_in_fd(),
+// macho_best_slice(), macho_best_slice_in_fd(), macho_dylib_install_name() -- is NOT implemented:
+// no image measured in this ladder's closure imports any of them (SymbolicationDT's 662 imports
+// contain exactly one macho_* name, the one below; CoreSymbolicationDT and MallocStackLoggingDT
+// import none).  Porting an unimported entry point would be inventing surface, not answering one.
+//
+
+// Apple's MachOFile::_s_archInfos[] (common/MachOFile.cpp, dyld-1125.5), verbatim -- including its
+// guards on the arm64e and arm64_32 entries, which resolve to nothing in this tree (see above).
+struct MachOArchInfo {
+	const char* name;
+	uint32_t    cputype;
+	uint32_t    cpusubtype;
+};
+
+static const MachOArchInfo sMachOArchInfos[] = {
+	{ "x86_64",   CPU_TYPE_X86_64,   CPU_SUBTYPE_X86_64_ALL  },
+	{ "x86_64h",  CPU_TYPE_X86_64,   CPU_SUBTYPE_X86_64_H    },
+	{ "i386",     CPU_TYPE_I386,     CPU_SUBTYPE_I386_ALL    },
+	{ "arm64",    CPU_TYPE_ARM64,    CPU_SUBTYPE_ARM64_ALL   },
+#if SUPPORT_ARCH_arm64e
+	{ "arm64e",   CPU_TYPE_ARM64,    CPU_SUBTYPE_ARM64E      },
+#endif
+#if SUPPORT_ARCH_arm64_32
+	{ "arm64_32", CPU_TYPE_ARM64_32, CPU_SUBTYPE_ARM64_32_V8 },
+#endif
+	{ "armv7k",   CPU_TYPE_ARM,      CPU_SUBTYPE_ARM_V7K     },
+	{ "armv7s",   CPU_TYPE_ARM,      CPU_SUBTYPE_ARM_V7S     },
+	{ "armv7",    CPU_TYPE_ARM,      CPU_SUBTYPE_ARM_V7      },
+	{ "armv6m",   CPU_TYPE_ARM,      CPU_SUBTYPE_ARM_V6M     },
+	{ "armv7m",   CPU_TYPE_ARM,      CPU_SUBTYPE_ARM_V7M     },
+	{ "armv7em",  CPU_TYPE_ARM,      CPU_SUBTYPE_ARM_V7EM    },
+	{ "armv8m",   CPU_TYPE_ARM,      CPU_SUBTYPE_ARM_V8M     },
+};
+
+// Apple's MachOFile::cpuTypeFromArchName() (common/MachOFile.cpp:566, dyld-1125.5).  The two
+// out parameters are assigned only on the match, which is what makes the miss path leave them as
+// the caller left them.
+static bool machoCPUTypeFromArchName(const char* archName, cpu_type_t* cputype, cpu_subtype_t* cpusubtype)
+{
+	for (const MachOArchInfo& info : sMachOArchInfos) {
+		if ( strcmp(archName, info.name) == 0 ) {
+			*cputype    = info.cputype;
+			*cpusubtype = info.cpusubtype;
+			return true;
+		}
+	}
+	return false;
+}
+
+extern "C" {
+bool macho_cpu_type_for_arch_name(const char* archName, cpu_type_t* type, cpu_subtype_t* subtype);
+}
+
+// Apple's macho_cpu_type_for_arch_name() (libdyld/utils.cpp:56, dyld-1125.5) is nothing but that
+// lookup: it declares both out parameters _Nonnull and answers false without writing them.
+bool macho_cpu_type_for_arch_name(const char* archName, cpu_type_t* type, cpu_subtype_t* subtype)
+{
+	return machoCPUTypeFromArchName(archName, type, subtype);
+}
