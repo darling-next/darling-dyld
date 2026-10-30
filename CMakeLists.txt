@@ -78,6 +78,19 @@ set_property(TARGET system_dyld_obj APPEND_STRING PROPERTY
 	COMPILE_FLAGS " -fno-exceptions -fno-rtti -DBUILDING_LIBDYLD=1")
 set_property(TARGET system_dyld APPEND_STRING PROPERTY
 	LINK_FLAGS " -Wl,-compatibility_version,1.0.0 -Wl,-current_version,421.1.0")
+
+# THE DYLD IMAGE IS THE SYSTEM. Apple's libxcrun decides whether a tool may run by asking dyld for the "host
+# version" -- util_has_valid_deployment_target() -> dyld_image_header_containing_address(&dyld API) ->
+# dyld_get_image_versions(that image) -> its minimum -- and the image containing the dyld API is
+# /usr/lib/system/libdyld.dylib. MEASURED: built with CMAKE_OSX_DEPLOYMENT_TARGET (11.0) it answered 11.0 while the
+# pinned toolchain's own minimum is 14.0, so every /usr/bin/{clang,cc,cpp} call through Darling's xcselect shims died
+# with "unable to execute utility ... because it requires a newer version of macOS" (reach: `make probes.h` in a
+# genuine Ruby 3.4.8 build, where dtrace preprocesses through /usr/bin/clang, and /usr/bin/clang --version itself).
+# The system already claims DARLING_EMULATED_MACOS_VERSION everywhere else, so this one image must answer the same.
+set(DARLING_DYLD_PLATFORM_VERSION_FLAGS
+	" -Wl,-platform_version,macos,${DARLING_EMULATED_MACOS_VERSION},${DARLING_EMULATED_MACOS_VERSION}")
+set_property(TARGET system_dyld APPEND_STRING PROPERTY LINK_FLAGS "${DARLING_DYLD_PLATFORM_VERSION_FLAGS}")
+set_property(TARGET system_dyld_firstpass APPEND_STRING PROPERTY LINK_FLAGS "${DARLING_DYLD_PLATFORM_VERSION_FLAGS}")
 #target_link_libraries(system_dyld PRIVATE platform_static32 platform_static64 system_c system_kernel compiler_rt launch)
 
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS_SAVED} -nostdlib")
