@@ -1336,13 +1336,13 @@ static void notifyBatchPartial(dyld_image_states state, bool orLater, dyld_image
 					// and restores their read-only protection afterwards.  Only
 					// images whose segments are already read-only take part, and
 					// only the ones reopened here are restored.
-					ImageLoader* reopenedImages[objcImageCount];
+					// Compact this list in place; paths/mhs retain the full batch.
 					unsigned reopenedCount = 0;
 					for (unsigned i=0; i < objcImageCount; ++i) {
 						ImageLoader* image = objcImages[i];
 						if ( (image != NULL) && image->madeReadOnly() && image->hasConstObjCSection() ) {
 							image->makeDataWritable();
-							reopenedImages[reopenedCount++] = image;
+							objcImages[reopenedCount++] = image;
 						}
 					}
 					dyld3::ScopedTimer timer(DBG_DYLD_TIMING_OBJC_MAP, 0, 0, 0);
@@ -1351,7 +1351,7 @@ static void notifyBatchPartial(dyld_image_states state, bool orLater, dyld_image
 					uint64_t t1 = mach_absolute_time();
 					ImageLoader::fgTotalObjCSetupTime += (t1-t0);
 					for (unsigned i=0; i < reopenedCount; ++i)
-						reopenedImages[i]->makeDataReadOnly();
+						objcImages[i]->makeDataReadOnly();
 				}
 			}
 		}
