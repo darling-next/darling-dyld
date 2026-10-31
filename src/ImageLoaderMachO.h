@@ -118,6 +118,7 @@ public:
 	virtual uint32_t					minOSVersion() const;
 	virtual const char*					libPath(unsigned int) const;
 	virtual	bool						notifyObjC() const { return fNotifyObjC; }
+	virtual bool						hasConstObjCSection() const;
 	virtual bool						overridesCachedDylib(uint32_t& num) const { num = fOverrideOfCacheImageNum; return (num != 0); }
 	virtual void						setOverridesCachedDylib(uint32_t num) { fOverrideOfCacheImageNum = num; }
 

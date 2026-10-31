@@ -1233,6 +1233,30 @@ void ImageLoaderMachOCompressed::makeDataReadOnly() const
 }
 
 
+void ImageLoaderMachOCompressed::makeDataWritable() const
+{
+#if !TEXT_RELOC_SUPPORT
+	if ( fReadOnlyDataSegment && !this->ImageLoader::inSharedCache() ) {
+		for (unsigned int i=0; i < fSegmentsCount; ++i) {
+			if ( segIsReadOnlyData(i) ) {
+				uintptr_t start = segActualLoadAddress(i);
+				uintptr_t size = segSize(i);
+	#if defined(__x86_64__) && !TARGET_OS_SIMULATOR
+				if ( dyld::isTranslated() ) {
+					// <rdar://problem/48325338> can't mprotect non-16KB segments
+					if ( ((size & 0x3FFF) != 0) || ((start & 0x3FFF) != 0) )
+						continue;
+				}
+	#endif
+				::mprotect((void*)start, size, PROT_READ | PROT_WRITE);
+				//dyld::log("make writable 0x%09lX -> 0x%09lX\n", (long)start, (long)(start+size));
+			}
+		}
+	}
+#endif
+}
+
+
 void ImageLoaderMachOCompressed::eachBind(const LinkContext& context, bind_handler handler)
 {
     try {

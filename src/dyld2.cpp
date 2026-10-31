@@ -1299,6 +1299,7 @@ static void notifyBatchPartial(dyld_image_states state, bool orLater, dyld_image
 			if ( (onlyHandler == NULL) && ((state == dyld_image_state_bound) || (orLater && (dyld_image_state_bound > state))) && (sNotifyObjCMapped != NULL) ) {
 				const char* paths[imageCount];
 				const mach_header* mhs[imageCount];
+				ImageLoader* objcImages[imageCount];
 				unsigned objcImageCount = 0;
 				for (int i=0; i < imageCount; ++i) {
 					ImageLoader* image = findImageByMachHeader(infos[i].imageLoadAddress);
@@ -1321,17 +1322,36 @@ static void notifyBatchPartial(dyld_image_states state, bool orLater, dyld_image
 					if ( hasObjC ) {
 						paths[objcImageCount] = infos[i].imageFilePath;
 						mhs[objcImageCount]   = infos[i].imageLoadAddress;
+						objcImages[objcImageCount] = image;
 						++objcImageCount;
 						if ( image != NULL )
 							image->setObjCMappedNotified();
 					}
 				}
 				if ( objcImageCount != 0 ) {
+					// Modern linkers place ObjC refs in a read-only __DATA_CONST
+					// segment, but the runtime rewrites those refs to canonical
+					// definitions while processing the mapped images.  Apple's
+					// dyld reopens exactly those segments for the notification
+					// and restores their read-only protection afterwards.  Only
+					// images whose segments are already read-only take part, and
+					// only the ones reopened here are restored.
+					ImageLoader* reopenedImages[objcImageCount];
+					unsigned reopenedCount = 0;
+					for (unsigned i=0; i < objcImageCount; ++i) {
+						ImageLoader* image = objcImages[i];
+						if ( (image != NULL) && image->madeReadOnly() && image->hasConstObjCSection() ) {
+							image->makeDataWritable();
+							reopenedImages[reopenedCount++] = image;
+						}
+					}
 					dyld3::ScopedTimer timer(DBG_DYLD_TIMING_OBJC_MAP, 0, 0, 0);
 					uint64_t t0 = mach_absolute_time();
 					(*sNotifyObjCMapped)(objcImageCount, paths, mhs);
 					uint64_t t1 = mach_absolute_time();
 					ImageLoader::fgTotalObjCSetupTime += (t1-t0);
+					for (unsigned i=0; i < reopenedCount; ++i)
+						reopenedImages[i]->makeDataReadOnly();
 				}
 			}
 		}

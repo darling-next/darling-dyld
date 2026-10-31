@@ -1021,6 +1021,20 @@ bool ImageLoaderMachO::segIsReadOnlyData(unsigned int segIndex) const
 			&& (segCmd->flags & SG_READ_ONLY) );
 }
 
+bool ImageLoaderMachO::hasConstObjCSection() const
+{
+	// Same predicate as Apple's MachOFile::hasConstObjCSection(): the ObjC ref
+	// sections that a modern linker places in the read-only __DATA_CONST
+	// segment.  Only such images can need the mapped-notification window.
+	void* sectionAddress = NULL;
+	uintptr_t sectionSize = 0;
+	const mach_header* mh = this->machHeader();
+	return findSection(mh, "__DATA_CONST", "__objc_selrefs", &sectionAddress, &sectionSize)
+		|| findSection(mh, "__DATA_CONST", "__objc_classrefs", &sectionAddress, &sectionSize)
+		|| findSection(mh, "__DATA_CONST", "__objc_protorefs", &sectionAddress, &sectionSize)
+		|| findSection(mh, "__DATA_CONST", "__objc_superrefs", &sectionAddress, &sectionSize);
+}
+
 void ImageLoaderMachO::UnmapSegments()
 {
 	// usually unmap image when done

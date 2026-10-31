@@ -70,6 +70,7 @@ public:
 	virtual void						registerInterposing(const LinkContext& context);
 	virtual bool						usesChainedFixups() const;
 	virtual void						makeDataReadOnly() const;
+	virtual void						makeDataWritable() const;
 
 protected:
 	virtual void						doInterpose(const LinkContext& context);

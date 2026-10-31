@@ -615,7 +615,14 @@ public:
 	virtual bool						usesChainedFixups() const { return false; }
 
 	virtual void						makeDataReadOnly() const {}
-	
+
+										// Modern linkers place the ObjC ref sections in the
+										// read-only __DATA_CONST segment.  dyld reopens only
+										// that segment for the objc mapped notification, when
+										// the runtime may rewrite refs in place.
+	virtual void						makeDataWritable() const {}
+	virtual bool						hasConstObjCSection() const { return false; }
+
 										// when resolving symbols look in subImage if symbol can't be found
 	void								reExport(ImageLoader* subImage);
 
@@ -627,6 +634,10 @@ public:
 	void								applyInterposing(const LinkContext& context);
 
 	dyld_image_states					getState() { return (dyld_image_states)fState; }
+
+										// true once this image's SG_READ_ONLY segments
+										// have actually been protected read-only
+	bool								madeReadOnly() const { return fMadeReadOnly; }
 
 	ino_t								getInode() const { return fInode; }
     dev_t                               getDevice() const { return fDevice; }
