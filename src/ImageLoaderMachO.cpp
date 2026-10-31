@@ -1846,15 +1846,17 @@ intptr_t ImageLoaderMachO::computeSlide(const mach_header* mh)
 
 // Mach-O segment and section names are fixed 16-byte fields.  A name that
 // fills the field (e.g. "__objc_protorefs") has no terminator inside it, so
-// comparing the field directly runs into the adjacent name field.  Apple's
-// dyld materializes such a name into a terminated copy before comparing;
-// do the same here.
+// comparing the field directly runs into the adjacent name field.  Preserve
+// Apple's terminated-name comparison semantics without copying the field.
 static bool machoNameMatches(const char field[16], const char* name)
 {
-	char terminated[17];
-	memcpy(terminated, field, 16);
-	terminated[16] = '\0';
-	return (strcmp(terminated, name) == 0);
+	for (unsigned i = 0; i < 16; ++i) {
+		if (field[i] != name[i])
+			return false;
+		if (name[i] == '\0')
+			return true;
+	}
+	return name[16] == '\0';
 }
 
 bool ImageLoaderMachO::findSection(const mach_header* mh, const char* segmentName, const char* sectionName, void** sectAddress, size_t* sectSize)
